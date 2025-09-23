@@ -639,41 +639,150 @@ def split_text_recursively(text, max_sentence_length=15, min_part_length=4):
     
     return ' '.join(new_sentences)
 
+def normalize_sentence_lengths(text, target_min=15, target_max=25, ideal_range=(18, 22)):
+    """
+    Unified sentence length normalizer that intelligently adjusts sentence lengths
+    toward an ideal range, avoiding the merge-then-split conflict.
+    
+    Args:
+        text: Input text to normalize
+        target_min: Minimum acceptable sentence length (words)
+        target_max: Maximum acceptable sentence length (words) 
+        ideal_range: Tuple of (min_ideal, max_ideal) word counts
+    
+    Returns:
+        Text with normalized sentence lengths
+    """
+    doc = nlp(text)
+    sentences = [sent.text.strip() for sent in doc.sents if sent.text.strip()]
+    
+    if not sentences:
+        return text
+        
+    i = 0
+    while i < len(sentences):
+        current_sent = sentences[i]
+        word_count = len(current_sent.split())
+        
+        # If sentence is too long, split it
+        if word_count > target_max:
+            split_result = split_long_sentence(current_sent)
+            if len(split_result) > 1:
+                # Replace current sentence with split results
+                sentences[i:i+1] = split_result
+                # Don't increment i, recheck the first new sentence
+                continue
+                
+        # If sentence is too short, try to merge with next
+        elif word_count < target_min and i + 1 < len(sentences):
+            next_sent = sentences[i + 1]
+            next_word_count = len(next_sent.split())
+            combined_length = word_count + next_word_count
+            
+            # Only merge if result won't be too long
+            if combined_length <= target_max:
+                combined = combine_two_sentences(current_sent, next_sent)
+                if combined and combined != current_sent + " " + next_sent:
+                    # Replace both sentences with combined result
+                    sentences[i:i+2] = [combined]
+                    # Don't increment i, recheck the new combined sentence
+                    continue
+        
+        # If in ideal range or no changes possible, move to next
+        i += 1
+    
+    return " ".join(sentences)
+
+def combine_two_sentences(sent1, sent2):
+    """
+    Intelligently combine two sentences using the existing combination logic.
+    This is a helper function for the unified approach.
+    """
+    # Create documents for analysis
+    doc1 = nlp(sent1)
+    doc2 = nlp(sent2)
+    
+    # Use the existing relationship detection and combination logic
+    relationship = detect_sentence_relationship(doc1, doc2)
+    if relationship == "none":
+        return None
+        
+    # Get appropriate connector and combine
+    connector = get_smart_connector_from_docs(doc1, doc2)
+    if not connector:
+        return None
+        
+    # Perform pronoun validation
+    if not enhanced_pronoun_check_from_docs(doc1, doc2, connector):
+        return None
+        
+    return sent1 + " " + connector + " " + sent2
+
+def split_long_sentence(sentence):
+    """
+    Split a single long sentence using the existing splitting logic.
+    This is a helper function for the unified approach.
+    """
+    doc = nlp(sentence)
+    tokens = [token for token in doc if not token.is_space]
+    
+    if len(tokens) <= 15:  # Not long enough to split
+        return [sentence]
+        
+    # Use existing split logic with pre-filtering
+    split_candidates = pre_filter_split_candidates(doc, min_part_length=4)
+    if not split_candidates:
+        return [sentence]
+        
+    target_middle = len(tokens) // 2
+    best_split = min(split_candidates, 
+                    key=lambda x: abs(x - target_middle))
+    
+    # Create the splits
+    first_part = " ".join([t.text for t in tokens[:best_split]])
+    second_part = " ".join([t.text for t in tokens[best_split:]])
+    
+    # Clean up and return
+    first_part = first_part.strip()
+    second_part = second_part.strip()
+    
+    if not second_part:
+        return [sentence]
+        
+    # Capitalize second part if needed
+    if second_part and second_part[0].islower():
+        second_part = second_part[0].upper() + second_part[1:]
+        
+    return [first_part + ".", second_part]
+
 # ================== MAIN HUMANIZE FUNCTION ==================
 
-def humanize_text(text, mode="all", synonym_fraction=0.3, sentence_threshold=6, split_long_sentences=False, max_sentence_length=15):
+def humanize_text(text, mode="unified", synonym_fraction=0.3, target_min=15, target_max=25):
     """
-    Main function to humanize AI-generated text.
+    Main function to humanize AI-generated text using a unified approach.
     
     Args:
         text: Input text to humanize
-        mode: "synonyms", "sentences", "both", or "split"
+        mode: "unified" (recommended), "synonyms", "legacy" for old behavior
         synonym_fraction: Fraction of frequent words to replace (default 0.3)
-        sentence_threshold: Max words per sentence to consider for merging (default 6)
-        split_long_sentences: Whether to split overly long sentences (default False)
-        max_sentence_length: Max words per sentence before splitting (default 15)
+        target_min: Minimum acceptable sentence length in words (default 15)
+        target_max: Maximum acceptable sentence length in words (default 25)
     """
     if mode == "synonyms":
         return add_synonums(text, fraction=synonym_fraction)
-    elif mode == "sentences":
-        return combine_sentences_recursive(text, short_threshold=sentence_threshold)
-    elif mode == "split":
-        return split_text_recursively(text, max_sentence_length=max_sentence_length)
-    elif mode == "both":
-        # Apply synonyms first, then sentence combination
+    elif mode == "legacy":
+        # Old behavior: apply synonyms, then merge, then split
         text = add_synonums(text, fraction=synonym_fraction)
-        text = combine_sentences_recursive(text, short_threshold=sentence_threshold)
-        if split_long_sentences:
-            text = split_text_recursively(text, max_sentence_length=max_sentence_length)
+        text = combine_sentences_recursive(text, short_threshold=6)
+        text = split_text_recursively(text, max_sentence_length=15)
         return text
-    elif mode == "all":
-        # Apply all techniques
+    elif mode == "unified":
+        # New unified approach: apply synonyms, then normalize lengths intelligently
         text = add_synonums(text, fraction=synonym_fraction)
-        text = combine_sentences_recursive(text, short_threshold=sentence_threshold)
-        text = split_text_recursively(text, max_sentence_length=max_sentence_length)
+        text = normalize_sentence_lengths(text, target_min=target_min, target_max=target_max)
         return text
     else:
-        raise ValueError("Mode must be 'synonyms', 'sentences', 'split', 'both', or 'all'")
+        raise ValueError("Mode must be 'synonyms', 'legacy', or 'unified'")
 
 # Example usage
 if __name__ == "__main__":
@@ -690,6 +799,6 @@ if __name__ == "__main__":
     The next morning, when Aria returned to the village, her eyes shimmered faintly with golden light. The people of Eldenwood noticed. The forest, long feared, had chosen her as its keeper.
     '''
     
-    # Apply all humanization techniques automatically
-    humanized_text = humanize_text(text, mode="all", synonym_fraction=0.3, sentence_threshold=6, max_sentence_length=15)
+    # Apply unified humanization approach (recommended)
+    humanized_text = humanize_text(text, mode="unified", synonym_fraction=0.3, target_min=15, target_max=25)
     print(humanized_text)
