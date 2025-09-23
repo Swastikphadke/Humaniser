@@ -1,6 +1,7 @@
 import spacy
 from textblob import TextBlob, Word
 import random
+import time
 from collections import Counter
 
 # Use larger model with word vectors, fallback to small model
@@ -8,7 +9,6 @@ try:
     nlp = spacy.load("en_core_web_md")  # Has word vectors
 except OSError:
     nlp = spacy.load("en_core_web_sm")  # Fallback to small model
-    print("Warning: Using small model without word vectors. Consider installing en_core_web_md")
 
 def add_synonums(text, fraction=0.25):
     doc = nlp(text) 
@@ -199,11 +199,12 @@ def enhanced_pronoun_check_from_docs(doc1, doc2):
     return False
 
 def detect_sentence_relationship(doc1, doc2):
-    """Improved relationship detection with better causal logic."""
-    # Check for basic "Action -> State" pattern
+    """
+    Detects relationship using a refined 'Action -> State' pattern.
+    Prevents misinterpreting descriptive adjectives as causal.
+    """
+    # Check for the "Action -> State" grammatical pattern
     has_action_verb = any(t.pos_ == "VERB" and t.dep_ == "ROOT" and t.lemma_ not in ["be", "have", "seem"] for t in doc1)
-    
-    # Check if second sentence describes a state with "be" + adjective
     is_state_description = False
     state_adjective = None
     if len(doc2) > 1 and doc2[1].lemma_ == "be":
@@ -212,54 +213,27 @@ def detect_sentence_relationship(doc1, doc2):
             is_state_description = True
             state_adjective = adj_token
 
-    # If basic pattern doesn't match, check for strong continuation
     if not (has_action_verb and is_state_description):
-        try:
-            if doc1.has_vector and doc2.has_vector and doc1.similarity(doc2) > 0.65:
-                return "strong_continuation"
-        except:
-            pass
+        if doc1.has_vector and doc2.has_vector and doc1.similarity(doc2) > 0.65:
+            return "strong_continuation"
         return "continuation"
 
-    # Enhanced semantic check for causality
+    # If the pattern matches, perform the semantic check
     subject_noun = next((t for t in doc1 if t.dep_ in ("nsubj", "nsubjpass")), None)
     action_verb = next((t for t in doc1 if t.dep_ == "ROOT"), None)
 
-    if not (subject_noun and action_verb and state_adjective):
+    if not (subject_noun and action_verb and state_adjective and 
+            subject_noun.has_vector and action_verb.has_vector and state_adjective.has_vector):
         return "continuation"
 
-    # Check for emotional/psychological states that can be caused by actions
-    emotion_adjectives = {"happy", "sad", "tired", "excited", "angry", "confident", "worried", "proud", "embarrassed", "surprised"}
-    physical_adjectives = {"fast", "slow", "strong", "weak", "big", "small", "heavy", "light"}
+    sim_adj_to_verb = state_adjective.similarity(action_verb)
+    sim_adj_to_subj = state_adjective.similarity(subject_noun)
     
-    adj_lemma = state_adjective.lemma_.lower()
-    
-    # Emotions can be caused by actions
-    if adj_lemma in emotion_adjectives:
-        # Special check: avoid illogical causality
-        if action_verb.lemma_ in ["run", "walk", "move"] and adj_lemma in ["fast", "slow"]:
-            return "continuation"  # "ran fast" is descriptive, not causal
-        return "causal"
-    
-    # Physical descriptions are usually not causal
-    if adj_lemma in physical_adjectives:
+    # If the adjective is much more related to the verb, it's descriptive, not causal.
+    if sim_adj_to_verb > sim_adj_to_subj + 0.15:
         return "continuation"
-    
-    # Use word vectors for semantic similarity if available
-    try:
-        if (subject_noun.has_vector and action_verb.has_vector and state_adjective.has_vector):
-            sim_adj_to_verb = state_adjective.similarity(action_verb)
-            sim_adj_to_subj = state_adjective.similarity(subject_noun)
-            
-            # If adjective is more related to the action than subject, it's descriptive
-            if sim_adj_to_verb > sim_adj_to_subj + 0.15:
-                return "continuation"
-            else:
-                return "causal"
-    except:
-        pass
-    
-    return "continuation"
+    else:
+        return "causal"
 
 def get_smart_connector_from_docs(doc1, doc2):
     """Get connector using the improved relationship logic."""
@@ -415,65 +389,307 @@ def combine_sentences_recursive(text, short_threshold=6):
     else:
         return result_text
 
-def humanize_text(text, mode="both", synonym_fraction=0.3, sentence_threshold=6):
+# ================== NEW SENTENCE SPLITTING FUNCTIONS ==================
+
+def pre_filter_split_candidates(doc, min_part_length=4):
+    """
+    Quick pre-filtering to find only plausible split points.
+    Returns list of token indices that could be good split points.
+    """
+    candidates = []
+    
+    for i in range(min_part_length, len(doc) - min_part_length + 1):
+        token = doc[i] if i < len(doc) else None
+        prev_token = doc[i - 1] if i > 0 else None
+        
+        # Only analyze tokens that could realistically be split points
+        is_candidate = False
+        
+        if prev_token and token:
+            # After punctuation followed by conjunctions/connectors
+            if (prev_token.text in [',', ';', ':'] and 
+                token.pos_ in ['CCONJ', 'SCONJ', 'ADV']):
+                is_candidate = True
+            
+            # After punctuation followed by relative pronouns
+            elif (prev_token.text == ',' and 
+                  token.lemma_ in ['which', 'who', 'that']):
+                is_candidate = True
+            
+            # Direct after semicolons (natural sentence breaks)
+            elif prev_token.text == ';':
+                is_candidate = True
+            
+            # At the start of new clauses (identified by subjects)
+            elif token.dep_ in ['nsubj', 'nsubjpass']:
+                is_candidate = True
+            
+            # After certain prepositions in long prepositional phrases
+            elif (token.pos_ == 'ADP' and 
+                  prev_token.text in [',', ';']):
+                is_candidate = True
+        
+        if is_candidate:
+            candidates.append(i)
+    
+    return candidates
+
+def analyze_split_quality(doc, split_index, target_middle):
+    """
+    Analyzes the quality of a potential split point using linguistic features.
+    Returns a score (higher = better split).
+    """
+    if split_index <= 0 or split_index >= len(doc):
+        return 0
+    
+    first_part_len = split_index
+    second_part_len = len(doc) - split_index
+    
+    # Base score starts at 0
+    score = 0
+    
+    # 1. BALANCE SCORE: Prefer splits closer to the middle
+    distance_from_middle = abs(split_index - target_middle)
+    max_distance = max(target_middle, len(doc) - target_middle)
+    balance_score = (max_distance - distance_from_middle) / max_distance * 100
+    score += balance_score
+    
+    # 2. MINIMUM LENGTH PENALTY: Heavily penalize if either part is too short
+    min_length = 4
+    if first_part_len < min_length or second_part_len < min_length:
+        score -= 200  # Heavy penalty for imbalanced splits
+    
+    # 3. LINGUISTIC BOUNDARY SCORE: Analyze the split point linguistically
+    split_token = doc[split_index] if split_index < len(doc) else None
+    prev_token = doc[split_index - 1] if split_index > 0 else None
+    
+    if prev_token and split_token:
+        # Coordinating conjunctions are excellent split points
+        if (prev_token.text == ',' and 
+            split_token.pos_ == 'CCONJ'):  # and, but, or, etc.
+            score += 50
+            
+        # Subordinating conjunctions are good split points
+        elif (prev_token.text == ',' and 
+              split_token.pos_ == 'SCONJ'):  # because, although, etc.
+            score += 40
+            
+        # Semicolons are natural breaks
+        elif prev_token.text == ';':
+            score += 45
+            
+        # Relative pronouns after commas
+        elif (prev_token.text == ',' and 
+              split_token.lemma_ in ['which', 'who', 'that']):
+            score += 35
+            
+        # Adverbial connectors
+        elif (prev_token.text == ',' and 
+              split_token.pos_ == 'ADV' and 
+              split_token.lemma_ in ['however', 'moreover', 'furthermore', 'therefore']):
+            score += 30
+    
+    # 4. SYNTACTIC DEPENDENCY SCORE: Prefer splits that don't break tight dependencies
+    if split_token and prev_token:
+        # Avoid splitting between tokens with strong dependencies
+        strong_deps = ['det', 'amod', 'compound', 'aux', 'auxpass']
+        
+        if (split_token.dep_ in strong_deps and split_token.head == prev_token) or \
+           (prev_token.dep_ in strong_deps and prev_token.head == split_token):
+            score -= 30  # Penalty for breaking strong dependencies
+    
+    # 5. CLAUSE BOUNDARY SCORE: Prefer splits at clause boundaries
+    if split_index > 0 and split_index < len(doc):
+        # Check if we're at the start of a new clause
+        for token in doc[split_index:split_index+3]:  # Look ahead a few tokens
+            if token.dep_ in ['nsubj', 'nsubjpass']:  # New subject = new clause
+                score += 25
+                break
+    
+    # 6. PUNCTUATION CONTEXT SCORE
+    if prev_token:
+        if prev_token.text in [',', ';', ':']:
+            score += 20  # Good to split after punctuation
+        elif prev_token.text in ['.', '!', '?']:
+            score -= 50  # Don't split after sentence endings
+    
+    return score
+
+def find_best_split_points(doc, min_part_length=4):
+    """
+    Optimized version: Pre-filter candidates then analyze only the promising ones.
+    Returns list of (index, score) tuples sorted by score (best first).
+    """
+    target_middle = len(doc) // 2
+    
+    # OPTIMIZATION 1: Pre-filter to get only plausible candidates
+    candidate_indices = pre_filter_split_candidates(doc, min_part_length)
+    
+    # If no candidates found, fallback to analyzing all positions (rare case)
+    if not candidate_indices:
+        candidate_indices = list(range(min_part_length, len(doc) - min_part_length + 1))
+    
+    scored_candidates = []
+    
+    # OPTIMIZATION 2: Only analyze the pre-filtered candidates
+    for i in candidate_indices:
+        score = analyze_split_quality(doc, i, target_middle)
+        if score > 0:  # Only consider positive scores
+            scored_candidates.append((i, score))
+    
+    # Sort by score (highest first)
+    scored_candidates.sort(key=lambda x: x[1], reverse=True)
+    return scored_candidates
+
+def clean_sentence_ending(text):
+    """Ensures proper sentence ending punctuation."""
+    text = text.strip()
+    
+    # Remove trailing commas and semicolons
+    while text.endswith((',', ';')):
+        text = text[:-1].strip()
+    
+    # Add period if no ending punctuation
+    if not text.endswith(('.', '!', '?')):
+        text += '.'
+    
+    return text
+
+def clean_sentence_beginning(text):
+    """Ensures proper sentence beginning capitalization."""
+    text = text.strip()
+    
+    # Capitalize first letter
+    if text:
+        text = text[0].upper() + text[1:]
+    
+    # Add period if no ending punctuation
+    if not text.endswith(('.', '!', '?')):
+        text += '.'
+    
+    return text
+
+def split_long_sentence(sentence_text, max_length=15, min_part_length=4):
+    """
+    Intelligently splits long sentences using linguistic analysis.
+    Returns a list of sentences.
+    """
+    doc = nlp(sentence_text)
+    
+    # Check if splitting is needed
+    if len(doc) <= max_length:
+        return [sentence_text]
+    
+    # Find the best split points (now optimized)
+    split_candidates = find_best_split_points(doc, min_part_length)
+    
+    if not split_candidates:
+        return [sentence_text]  # No good split found
+    
+    # Use the best split point
+    best_split_index, best_score = split_candidates[0]
+    
+    # Extract the two parts
+    first_part = doc[:best_split_index]
+    second_part = doc[best_split_index:]
+    
+    # Clean up the text
+    first_text = first_part.text.strip()
+    second_text = second_part.text.strip()
+    
+    # Handle punctuation intelligently
+    first_text = clean_sentence_ending(first_text)
+    second_text = clean_sentence_beginning(second_text)
+    
+    return [first_text, second_text]
+
+def split_text_recursively(text, max_sentence_length=15, min_part_length=4):
+    """
+    Optimized version using spaCy's sentence segmentation for consistency.
+    Recursively splits all long sentences in a text.
+    """
+    # Use spaCy for sentence segmentation instead of TextBlob
+    doc = nlp(text)
+    sentences = list(doc.sents)
+    
+    new_sentences = []
+    changes_made = False
+    
+    for sentence in sentences:
+        sentence_str = sentence.text.strip()
+        sentence_doc = nlp(sentence_str)  # Re-parse individual sentence for accuracy
+        
+        if len(sentence_doc) > max_sentence_length:
+            split_results = split_long_sentence(sentence_str, max_sentence_length, min_part_length)
+            new_sentences.extend(split_results)
+            if len(split_results) > 1:
+                changes_made = True
+        else:
+            new_sentences.append(sentence_str)
+    
+    # If we made changes, recursively check again (some splits might still be too long)
+    if changes_made:
+        result_text = ' '.join(new_sentences)
+        # Check if any sentence is still too long using spaCy
+        result_doc = nlp(result_text)
+        needs_more_splitting = any(len(nlp(sent.text)) > max_sentence_length for sent in result_doc.sents)
+        
+        if needs_more_splitting:
+            return split_text_recursively(result_text, max_sentence_length, min_part_length)
+    
+    return ' '.join(new_sentences)
+
+# ================== MAIN HUMANIZE FUNCTION ==================
+
+def humanize_text(text, mode="all", synonym_fraction=0.3, sentence_threshold=6, split_long_sentences=False, max_sentence_length=15):
     """
     Main function to humanize AI-generated text.
     
     Args:
         text: Input text to humanize
-        mode: "synonyms", "sentences", or "both"
+        mode: "synonyms", "sentences", "both", or "split"
         synonym_fraction: Fraction of frequent words to replace (default 0.3)
         sentence_threshold: Max words per sentence to consider for merging (default 6)
+        split_long_sentences: Whether to split overly long sentences (default False)
+        max_sentence_length: Max words per sentence before splitting (default 15)
     """
     if mode == "synonyms":
         return add_synonums(text, fraction=synonym_fraction)
     elif mode == "sentences":
         return combine_sentences_recursive(text, short_threshold=sentence_threshold)
+    elif mode == "split":
+        return split_text_recursively(text, max_sentence_length=max_sentence_length)
     elif mode == "both":
         # Apply synonyms first, then sentence combination
         text = add_synonums(text, fraction=synonym_fraction)
         text = combine_sentences_recursive(text, short_threshold=sentence_threshold)
+        if split_long_sentences:
+            text = split_text_recursively(text, max_sentence_length=max_sentence_length)
+        return text
+    elif mode == "all":
+        # Apply all techniques
+        text = add_synonums(text, fraction=synonym_fraction)
+        text = combine_sentences_recursive(text, short_threshold=sentence_threshold)
+        text = split_text_recursively(text, max_sentence_length=max_sentence_length)
         return text
     else:
-        raise ValueError("Mode must be 'synonyms', 'sentences', or 'both'")
+        raise ValueError("Mode must be 'synonyms', 'sentences', 'split', 'both', or 'all'")
 
-# Test the functions
-text = '''
-The village of Eldenwood sat quietly at the edge of a vast forest, where the trees grew so tall their tops seemed to brush the clouds. Most villagers avoided the forest after dusk, for it was said to be alive with whispers and shadows that didn't belong to any living thing.
+# Example usage
+if __name__ == "__main__":
+    # Sample text for demonstration
+    text = '''
+    The village of Eldenwood sat quietly at the edge of a vast forest, where the trees grew so tall their tops seemed to brush the clouds. Most villagers avoided the forest after dusk, for it was said to be alive with whispers and shadows that didn't belong to any living thing.
 
-One evening, a young girl named Aria lingered too long by the riverbank. The sun slipped below the horizon, and the familiar path home dissolved into darkness. Instead of fear, curiosity bloomed in her chest. She stepped deeper into the woods, drawn by a soft golden glow flickering between the trunks.
+    One evening, a young girl named Aria lingered too long by the riverbank. The sun slipped below the horizon, and the familiar path home dissolved into darkness. Instead of fear, curiosity bloomed in her chest. She stepped deeper into the woods, drawn by a soft golden glow flickering between the trunks.
 
-The light led her to a clearing where an ancient oak stood, hollow at its base. Inside, tiny orbs of light swirled like stars in miniature. They pulsed gently, as if breathing. Aria reached out, and one orb settled into her palm, warm as sunlight.
+    The light led her to a clearing where an ancient oak stood, hollow at its base. Inside, tiny orbs of light swirled like stars in miniature. They pulsed gently, as if breathing. Aria reached out, and one orb settled into her palm, warm as sunlight.
 
-Suddenly, the whispers grew louder—but they weren't frightening. They carried words, old and kind: "Guardian chosen."
+    Suddenly, the whispers grew louder—but they weren't frightening. They carried words, old and kind: "Guardian chosen."
 
-The next morning, when Aria returned to the village, her eyes shimmered faintly with golden light. The people of Eldenwood noticed. The forest, long feared, had chosen her as its keeper.
-'''
-
-print("Choose an option:")
-print("1. Add synonyms only")
-print("2. Change sentence length only") 
-print("3. Do both")
-
-choice = input("Enter your choice (1/2/3): ")
-
-if choice == "1":
-    updated_text = humanize_text(text, mode="synonyms", synonym_fraction=0.5)
-    print("\n" + "="*50)
-    print("SYNONYMS ONLY:")
-    print("="*50)
-elif choice == "2":
-    updated_text = humanize_text(text, mode="sentences", sentence_threshold=6)
-    print("\n" + "="*50)
-    print("SENTENCE COMBINATION ONLY:")
-    print("="*50)
-elif choice == "3":
-    updated_text = humanize_text(text, mode="both", synonym_fraction=0.3, sentence_threshold=6)
-    print("\n" + "="*50)
-    print("BOTH TECHNIQUES APPLIED:")
-    print("="*50)
-else:
-    print("Invalid choice!")
-    updated_text = text
-
-print(updated_text)
+    The next morning, when Aria returned to the village, her eyes shimmered faintly with golden light. The people of Eldenwood noticed. The forest, long feared, had chosen her as its keeper.
+    '''
+    
+    # Apply all humanization techniques automatically
+    humanized_text = humanize_text(text, mode="all", synonym_fraction=0.3, sentence_threshold=6, max_sentence_length=15)
+    print(humanized_text)
