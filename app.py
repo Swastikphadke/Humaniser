@@ -2,13 +2,496 @@ import spacy
 from textblob import TextBlob, Word
 import random
 import time
+import re
+import math
 from collections import Counter
+from dataclasses import dataclass, field
+from typing import List, Tuple, Optional, Dict, Iterable, Callable, Any, Sequence
 
 # Use larger model with word vectors, fallback to small model
 try:
     nlp = spacy.load("en_core_web_md")  # Has word vectors
 except OSError:
     nlp = spacy.load("en_core_web_sm")  # Fallback to small model
+
+# =========================
+# Filler Phrase Categories
+# =========================
+PREFIX_ONLY = [
+    "to be honest",
+    "frankly",
+    "in fact",
+    "after all",
+    "generally speaking",
+    "quite honestly",
+    "if you think about it"
+]
+
+FLEXIBLE = [
+    "actually",
+    "basically",
+    "you know",
+    "truthfully"
+]
+
+SUFFIX_ONLY = [
+    "in a way"
+]
+
+FILLER_PHRASES = PREFIX_ONLY + FLEXIBLE + SUFFIX_ONLY
+
+# Argumentative-only fillers (semantic filter)
+ARGUMENTATIVE_FILLERS = {"after all", "in fact"}
+
+# Style presets (extended with strict formal)
+STYLE_FILTERS: Dict[str, Sequence[str]] = {
+    "neutral": FILLER_PHRASES,
+    "casual": FLEXIBLE + ["you know", "to be honest", "basically", "frankly", "in a way"],
+    # "formal" keeps mild discourse softeners but excludes more casual ones
+    "formal": ["in fact", "after all", "generally speaking", "truthfully"],
+    # "formal_strict" removes borderline informal phrases
+    "formal_strict": ["in fact", "truthfully", "generally speaking"],
+}
+
+DISCOURSE_LEAD_INS = {
+    "however", "moreover", "therefore", "thus", "meanwhile", "furthermore",
+    "nevertheless", "nonetheless", "consequently", "additionally", "instead",
+    "nonetheless", "still", "otherwise"
+}
+
+CAUSAL_CONTRAST_MARKERS = {
+    "because", "since", "therefore", "thus", "hence", "so", "but", "although",
+    "though", "however", "yet", "whereas", "while", "consequently", "thereby"
+}
+
+WEAK_FUNCTION_WORDS = {"and", "but", "or", "so", "yet"}
+
+ZERO_WIDTH_MARK = "\u200B"  # used for subtle marker if needed
+
+# =========================
+# Config Dataclass
+# =========================
+@dataclass
+class FillerConfig:
+    ratio: float = 0.2
+    style: str = "neutral"
+    min_sentence_len: int = 4
+    recent_window: int = 4
+    repetition_recent_penalty: float = 1.2
+    repetition_global_penalty: float = 0.4  # linear mode penalty strength
+    repetition_global_alpha: float = 0.55   # exponential decay alpha
+    use_exponential: bool = False           # toggles exponential weight formula
+    skip_discourse_lead: bool = True
+    skip_all_caps: bool = True
+    skip_dialogue: bool = True
+    skip_quote_dominated: bool = True       # POS/quote aware avoidance
+    mode_weights: Optional[Dict[str, float]] = None
+    allow_reapply: bool = False
+    structured_plan: bool = False           # return (text, plan)
+    dry_run: bool = False                   # only plan, no modification
+    nlp_pipeline: Any = None                # dependency injection
+    logging_callback: Optional[Callable[[Dict[str, Any]], None]] = None
+    enforce_semantics: bool = True          # semantic relevance gating
+    attach_marker: bool = True              # add hidden marker to output
+
+# =========================
+# Utility / Detection Helpers
+# =========================
+def _is_all_caps(sent: str) -> bool:
+    core = sent.strip()
+    letters = [c for c in core if c.isalpha()]
+    if len(letters) < 3:
+        return False
+    return all(c.isupper() for c in letters)
+
+def _is_dialogue(sent: str) -> bool:
+    s = sent.strip()
+    return s.startswith(("\"", "'", '''"''', "'"))
+
+def _quote_dominated(sent: str) -> bool:
+    total = len(sent)
+    if total == 0:
+        return False
+    quote_chars = sent.count('"') + sent.count("'") + sent.count('"') + sent.count('"') + sent.count(''') + sent.count(''')
+    return (quote_chars / total) > 0.28  # heuristic threshold
+
+def _already_has_filler(sent_text: str) -> bool:
+    lowered = sent_text.strip().lower()
+    for fp in FILLER_PHRASES:
+        if lowered.startswith(fp + ",") or lowered.startswith(fp + " ,"):
+            return True
+    return False
+
+def _starts_with_discourse_marker(sent_text: str) -> bool:
+    first = sent_text.strip().split()[:1]
+    return bool(first and first[0].lower().rstrip(",.") in DISCOURSE_LEAD_INS)
+
+def _is_argumentative(span) -> bool:
+    for token in span:
+        if token.lemma_.lower() in CAUSAL_CONTRAST_MARKERS:
+            return True
+    return False
+
+# =========================
+# Subject / Mid Insertion Logic
+# =========================
+def _find_subject_subtree_end(span) -> Optional[int]:
+    # span is a Span referencing parent doc; use token.i relative indices
+    root = None
+    for t in span:
+        if t.dep_ == "ROOT" or t.head == t:  # safety
+            root = t
+            break
+    if not root:
+        return None
+    subj = None
+    for child in root.children:
+        if child.dep_ in ("nsubj", "nsubjpass") and child in span:
+            subj = child
+            break
+    if not subj:
+        # fallback after root if inside span
+        if root.i + 1 < span.end:
+            rel = root.i - span.start + 1
+            return rel
+        return None
+    end_abs = max(tok.i for tok in subj.subtree if tok in span) + 1
+    if end_abs < span.end - 1:
+        return end_abs - span.start
+    return None
+
+def _sanitize_for_prefix(span, original: str) -> str:
+    # Skip lowering if first token is PROPN or entity
+    if not original:
+        return original
+    first_token = span[0]
+    if first_token.pos_ == 'PROPN' or first_token.ent_type_:
+        return original
+    if original[0].isalpha():
+        return original[0].lower() + original[1:]
+    return original
+
+# =========================
+# Mode & Filler Selection
+# =========================
+DEFAULT_MODE_WEIGHTS = {"prefix": 0.5, "mid": 0.3, "suffix": 0.2}
+
+def _choose_mode(rng: random.Random, mode_weights: Dict[str, float]) -> int:
+    pw, mw, sw = mode_weights.get("prefix", 0.5), mode_weights.get("mid", 0.3), mode_weights.get("suffix", 0.2)
+    total = max(1e-9, pw + mw + sw)
+    return rng.choices([0, 1, 2], weights=[pw/total, mw/total, sw/total], k=1)[0]
+
+def _candidate_fillers_for_mode(mode: int) -> List[str]:
+    if mode == 0:
+        return list(PREFIX_ONLY + FLEXIBLE)
+    if mode == 1:
+        return list(FLEXIBLE)
+    if mode == 2:
+        return list(SUFFIX_ONLY + FLEXIBLE)
+    return FILLER_PHRASES
+
+# =========================
+# Repetition Weighting
+# =========================
+def _linear_weight(filler: str, global_freq: Dict[str, int], recent: List[str], recent_penalty: float, global_penalty: float) -> float:
+    base = 1.0
+    gf = global_freq.get(filler, 0)
+    if gf:
+        base /= (1.0 + global_penalty * gf)
+    if filler in recent:
+        occurrences = recent.count(filler)
+        base /= (1.0 + recent_penalty * occurrences)
+    return max(base, 1e-6)
+
+def _exp_weight(filler: str, global_freq: Dict[str, int], recent: List[str], recent_penalty: float, alpha: float) -> float:
+    freq = global_freq.get(filler, 0)
+    base = math.exp(-alpha * freq)
+    if filler in recent:
+        occurrences = recent.count(filler)
+        base /= (1.0 + recent_penalty * occurrences)
+    return max(base, 1e-8)
+
+def _get_weighted_filler(
+    rng: random.Random,
+    fillers: List[str],
+    global_freq: Dict[str, int],
+    recent: List[str],
+    cfg: FillerConfig
+) -> Optional[str]:
+    
+    if not fillers:
+        return None
+        
+    # Select the weighting function based on the config
+    if cfg.use_exponential:
+        weight_fn = lambda f: _exp_weight(f, global_freq, recent, cfg.repetition_recent_penalty, cfg.repetition_global_alpha)
+    else:
+        weight_fn = lambda f: _linear_weight(f, global_freq, recent, cfg.repetition_recent_penalty, cfg.repetition_global_penalty)
+    
+    # Calculate the weight (score) for each candidate filler - FIX: Call the function
+    weights = [weight_fn(f) for f in fillers]
+    
+    # Use random.choices to pick one filler based on the calculated weights
+    return rng.choices(population=fillers, weights=weights, k=1)[0]
+
+def _weighted_choice(rng: random.Random, fillers: List[str], weight_fn) -> str:
+    scores = [weight_fn(f) for f in fillers]
+    total = sum(scores)
+    if total <= 0:
+        return rng.choice(fillers)
+    r = rng.random() * total
+    acc = 0.0
+    for f, s in zip(fillers, scores):
+        acc += s
+        if acc >= r:
+            return f
+    return fillers[-1]
+
+# =========================
+# Insertion Realization
+# =========================
+def _post_subject_index(span) -> Optional[int]:
+    idx = _find_subject_subtree_end(span)
+    if idx is None:
+        return None
+    # Skip weak function words moving forward
+    j = idx
+    while j < len(span) and span[j].lemma_.lower() in WEAK_FUNCTION_WORDS:
+        j += 1
+    if j < len(span) - 1:
+        return j
+    return idx
+
+def _insert_prefix(span, filler: str) -> str:
+    original = span.text
+    filler_form = filler[0].upper() + filler[1:]
+    return f"{filler_form}, {_sanitize_for_prefix(span, original)}"
+
+def _insert_mid(span, filler: str) -> Optional[str]:
+    rel = _post_subject_index(span)
+    if rel is not None and 1 < rel < len(span) - 2:
+        before = span[:rel].text.rstrip()
+        after = span[rel:].text.lstrip()
+        sep = "" if before.endswith(',') else ","
+        return f"{before}{sep} {filler}, {after}"
+    # Fallback: first comma inside span
+    for i, t in enumerate(span):
+        if t.text == ',' and i < len(span) - 4:
+            before = span[:i+1].text.rstrip()
+            after = span[i+1:].text.lstrip()
+            return f"{before} {filler}, {after}"
+    # Secondary fallback: token with advmod/aux soon after root
+    for i, t in enumerate(span):
+        if t.dep_ in ("advmod", "aux", "auxpass") and 1 < i < len(span) - 3:
+            before = span[:i].text.rstrip()
+            after = span[i:].text.lstrip()
+            return f"{before}, {filler}, {after}"
+    # Final fallback: 1/3 position
+    if len(span) >= 6:
+        pos = max(2, len(span)//3)
+        before = span[:pos].text
+        after = span[pos:].text
+        return f"{before}, {filler}, {after}"
+    return None
+
+def _insert_suffix(span, filler: str) -> str:
+    text = span.text.strip()
+    # Handle trailing quotes / ellipsis
+    match = re.search(r'(.*?)([\.\!\?]+)?([" " "])?$', text)
+    if match:
+        core = match.group(1).rstrip()
+        punct = (match.group(2) or '') + (match.group(3) or '')
+    else:
+        core, punct = text, ''
+    if core.endswith(','):
+        core = core.rstrip(', ').rstrip()
+    return f"{core}, {filler}{punct}"
+
+def _realize_insertion(span, filler: str, mode: int) -> str:
+    if mode == 0:
+        return _insert_prefix(span, filler)
+    if mode == 1:
+        mid_variant = _insert_mid(span, filler)
+        if mid_variant:
+            return mid_variant
+        return _insert_suffix(span, filler)
+    return _insert_suffix(span, filler)
+
+# =========================
+# Double Application Guard
+# =========================
+def _already_processed(sentences: List[str]) -> bool:
+    count = sum(1 for s in sentences if _already_has_filler(s))
+    return (count / max(1, len(sentences))) > 0.4
+
+# =========================
+# Semantic gating of fillers
+# =========================
+def _filter_fillers_by_semantics(fillers: List[str], span, enforce: bool) -> List[str]:
+    if not enforce:
+        return fillers
+    if not fillers:
+        return fillers
+    if any(f in ARGUMENTATIVE_FILLERS for f in fillers):
+        arg_needed = _is_argumentative(span)
+        if not arg_needed:
+            # remove argumentative-only options
+            fillers = [f for f in fillers if f not in ARGUMENTATIVE_FILLERS]
+            # (The second condition redundant but keeps clarity)
+    return fillers or []
+
+# =========================
+# Main Filler API
+# =========================
+def add_fillers(
+    text: str,
+    config: Optional[FillerConfig] = None,
+    seed: Optional[int] = None,
+    rng: Optional[random.Random] = None,
+) -> Any:
+    """Insert filler phrases into text with advanced linguistic controls.
+
+    Returns:
+        If config.structured_plan True -> (modified_text_or_original, plan_list)
+        Else -> modified text (string) or plan repr if dry_run.
+    """
+    cfg = config or FillerConfig()
+
+    # Use provided rng else seed
+    if rng is None:
+        rng = random.Random(seed)
+
+    # External pipeline or default
+    pipeline = cfg.nlp_pipeline or nlp
+    doc = pipeline(text)
+    spans = list(doc.sents)
+    if not spans:
+        return (text, []) if cfg.structured_plan else text
+
+    sentences = [s.text for s in spans]
+
+    if not cfg.allow_reapply and _already_processed(sentences):
+        if cfg.structured_plan:
+            return (text, [])
+        return text
+
+    allowed_fillers = list(STYLE_FILTERS.get(cfg.style, FILLER_PHRASES))
+    mode_weights = cfg.mode_weights or DEFAULT_MODE_WEIGHTS
+
+    # Candidate sentence indices with precomputed flags
+    candidates: List[int] = []
+    for i, span in enumerate(spans):
+        stripped = span.text.strip()
+        if len(stripped.split()) < cfg.min_sentence_len:
+            continue
+        if cfg.skip_all_caps and _is_all_caps(stripped):
+            continue
+        if cfg.skip_dialogue and _is_dialogue(stripped):
+            continue
+        if cfg.skip_quote_dominated and _quote_dominated(stripped):
+            continue
+        if _already_has_filler(stripped):
+            continue
+        if cfg.skip_discourse_lead and _starts_with_discourse_marker(stripped):
+            continue
+        candidates.append(i)
+
+    if not candidates:
+        return (text, []) if cfg.structured_plan else text
+
+    rng.shuffle(candidates)
+    target = max(1, int(len(spans) * cfg.ratio))
+    chosen = sorted(candidates[:target])
+    chosen_set = set(chosen)
+
+    global_freq: Dict[str, int] = {}
+    recent: List[str] = []
+    plan: List[Dict[str, Any]] = []
+    output: List[str] = []
+
+    for idx, span in enumerate(spans):
+        original_text = span.text.strip()
+        if idx not in chosen_set:
+            output.append(original_text)
+            continue
+        # Decide insertion mode first
+        mode = _choose_mode(rng, mode_weights)
+        mode_fillers = [f for f in _candidate_fillers_for_mode(mode) if f in allowed_fillers]
+
+        # Semantic gating
+        mode_fillers = _filter_fillers_by_semantics(mode_fillers, span, cfg.enforce_semantics)
+        if not mode_fillers:
+            output.append(original_text)
+            continue
+
+        filler = _get_weighted_filler(rng, mode_fillers, global_freq, recent, cfg)
+        if not filler:
+            output.append(original_text)
+            continue
+        new_sentence = _realize_insertion(span, filler, mode)
+        output.append(new_sentence)
+
+        recent.append(filler)
+        global_freq[filler] = global_freq.get(filler, 0) + 1
+        entry = {"index": idx, "filler": filler, "mode": mode, "argumentative": _is_argumentative(span)}
+        plan.append(entry)
+        if cfg.logging_callback:
+            try:
+                cfg.logging_callback(entry)
+            except Exception:
+                pass
+
+    result_text = " ".join(output)
+    if cfg.attach_marker:
+        result_text += ZERO_WIDTH_MARK  # subtle marker
+
+    if cfg.dry_run:
+        return plan if cfg.structured_plan else repr(plan)
+    if cfg.structured_plan:
+        return result_text, plan
+    return result_text
+
+# =========================
+# Undo / Removal Support
+# =========================
+# Build alternation once
+_FILLER_ALT = "|".join(re.escape(f) for f in FILLER_PHRASES)
+
+FILLER_PATTERN_PREFIX = re.compile(rf"^(?:{_FILLER_ALT})\s*,\s*", re.IGNORECASE)
+FILLER_PATTERN_MID = re.compile(rf",\s*(?:{_FILLER_ALT})\s*,\s*", re.IGNORECASE)
+# New: use lookahead; do not consume trailing punctuation/end  
+FILLER_PATTERN_SUFFIX = re.compile(
+    rf",\s*(?:{_FILLER_ALT})(?=(?:[\.\!\?]+(?:['\"\u201c\u201d])?\s*$)|\s*$)",
+    re.IGNORECASE
+)
+
+def remove_fillers(text: str, nlp_pipeline: Any = None) -> str:
+    pipeline = nlp_pipeline or nlp
+    def _clean_sentence(s: str) -> str:
+        s0 = s
+        s = FILLER_PATTERN_PREFIX.sub("", s)
+        # Mid occurrences – iterate until stable
+        while True:
+            ns = FILLER_PATTERN_MID.sub(", ", s)
+            if ns == s:
+                break
+            s = ns
+        # Suffix (lookahead version) – simple replace
+        s = FILLER_PATTERN_SUFFIX.sub("", s)
+        s = re.sub(r"\s+,\s+", ", ", s)
+        s = re.sub(r"\s+", " ", s).strip()
+        return s or s0
+    try:
+        d = pipeline(text)
+        sent_texts = [span.text for span in d.sents]
+    except Exception:
+        sent_texts = re.split(r'(?<=[\.!?])\s+', text)
+    cleaned = [_clean_sentence(s) for s in sent_texts if s.strip()]
+    return " ".join(cleaned).replace(ZERO_WIDTH_MARK, '')
+
+# =========================
+# EXISTING SYNONYM FUNCTIONS
+# =========================
 
 def add_synonums(text, fraction=0.25):
     doc = nlp(text) 
@@ -413,7 +896,7 @@ def pre_filter_split_candidates(doc, min_part_length=4):
             
             # After punctuation followed by relative pronouns
             elif (prev_token.text == ',' and 
-                  token.lemma_ in ['which', 'who', 'that']):
+                token.lemma_ in ['which', 'who', 'that']):
                 is_candidate = True
             
             # Direct after semicolons (natural sentence breaks)
@@ -426,7 +909,7 @@ def pre_filter_split_candidates(doc, min_part_length=4):
             
             # After certain prepositions in long prepositional phrases
             elif (token.pos_ == 'ADP' and 
-                  prev_token.text in [',', ';']):
+                prev_token.text in [',', ';']):
                 is_candidate = True
         
         if is_candidate:
@@ -471,7 +954,7 @@ def analyze_split_quality(doc, split_index, target_middle):
             
         # Subordinating conjunctions are good split points
         elif (prev_token.text == ',' and 
-              split_token.pos_ == 'SCONJ'):  # because, although, etc.
+            split_token.pos_ == 'SCONJ'):  # because, although, etc.
             score += 40
             
         # Semicolons are natural breaks
@@ -480,13 +963,13 @@ def analyze_split_quality(doc, split_index, target_middle):
             
         # Relative pronouns after commas
         elif (prev_token.text == ',' and 
-              split_token.lemma_ in ['which', 'who', 'that']):
+            split_token.lemma_ in ['which', 'who', 'that']):
             score += 35
             
         # Adverbial connectors
         elif (prev_token.text == ',' and 
-              split_token.pos_ == 'ADV' and 
-              split_token.lemma_ in ['however', 'moreover', 'furthermore', 'therefore']):
+            split_token.pos_ == 'ADV' and 
+            split_token.lemma_ in ['however', 'moreover', 'furthermore', 'therefore']):
             score += 30
     
     # 4. SYNTACTIC DEPENDENCY SCORE: Prefer splits that don't break tight dependencies
@@ -495,7 +978,7 @@ def analyze_split_quality(doc, split_index, target_middle):
         strong_deps = ['det', 'amod', 'compound', 'aux', 'auxpass']
         
         if (split_token.dep_ in strong_deps and split_token.head == prev_token) or \
-           (prev_token.dep_ in strong_deps and prev_token.head == split_token):
+        (prev_token.dep_ in strong_deps and prev_token.head == split_token):
             score -= 30  # Penalty for breaking strong dependencies
     
     # 5. CLAUSE BOUNDARY SCORE: Prefer splits at clause boundaries
@@ -713,53 +1196,31 @@ def combine_two_sentences(sent1, sent2):
         return None
         
     # Perform pronoun validation
-    if not enhanced_pronoun_check_from_docs(doc1, doc2, connector):
+    if not enhanced_pronoun_check_from_docs(doc1, doc2):
         return None
         
     return sent1 + " " + connector + " " + sent2
 
-def split_long_sentence(sentence):
-    """
-    Split a single long sentence using the existing splitting logic.
-    This is a helper function for the unified approach.
-    """
-    doc = nlp(sentence)
-    tokens = [token for token in doc if not token.is_space]
-    
-    if len(tokens) <= 15:  # Not long enough to split
-        return [sentence]
-        
-    # Use existing split logic with pre-filtering
-    split_candidates = pre_filter_split_candidates(doc, min_part_length=4)
-    if not split_candidates:
-        return [sentence]
-        
-    target_middle = len(tokens) // 2
-    best_split = min(split_candidates, 
-                    key=lambda x: abs(x - target_middle))
-    
-    # Create the splits
-    first_part = " ".join([t.text for t in tokens[:best_split]])
-    second_part = " ".join([t.text for t in tokens[best_split:]])
-    
-    # Clean up and return
-    first_part = first_part.strip()
-    second_part = second_part.strip()
-    
-    if not second_part:
-        return [sentence]
-        
-    # Capitalize second part if needed
-    if second_part and second_part[0].islower():
-        second_part = second_part[0].upper() + second_part[1:]
-        
-    return [first_part + ".", second_part]
-
 # ================== MAIN HUMANIZE FUNCTION ==================
 
-def humanize_text(text, mode="unified", synonym_fraction=0.3, target_min=15, target_max=25):
+def clean_text_output(text):
+    """Clean up formatting issues in the final output."""
+    # Fix stray punctuation patterns
+    text = re.sub(r'\s*\.\s*;\s*', '. ', text)  # Fix ". ;" → ". "
+    text = re.sub(r'\s*,\s*and\s+', ', and ', text)  # Fix ", and " spacing
+    text = re.sub(r'\s+', ' ', text)  # Fix multiple spaces
+    text = re.sub(r'\s+([.!?])', r'\1', text)  # Fix space before punctuation
+    text = re.sub(r'([.!?])\s*([a-z])', r'\1 \2', text)  # Ensure space after punctuation
+    
+    # Fix sentence fragments that start with conjunctions
+    text = re.sub(r'\.\s*(and|but|or|so)\s+([A-Z])', r', \1 \2', text)
+    
+    return text.strip()
+
+def humanize_text(text, mode="unified", synonym_fraction=0.3, target_min=15, target_max=25, 
+                 filler_style="neutral", filler_ratio=0.0, apply_fillers=False):
     """
-    Main function to humanize AI-generated text using a unified approach.
+    Main function to humanize AI-generated text using a unified approach with optional fillers.
     
     Args:
         text: Input text to humanize
@@ -767,22 +1228,38 @@ def humanize_text(text, mode="unified", synonym_fraction=0.3, target_min=15, tar
         synonym_fraction: Fraction of frequent words to replace (default 0.3)
         target_min: Minimum acceptable sentence length in words (default 15)
         target_max: Maximum acceptable sentence length in words (default 25)
+        filler_style: Style for filler phrases ("neutral", "casual", "formal", "formal_strict")
+        filler_ratio: Fraction of sentences to add fillers to (0.0-1.0)
+        apply_fillers: Whether to apply filler phrases
     """
     if mode == "synonyms":
-        return add_synonums(text, fraction=synonym_fraction)
+        result = add_synonums(text, fraction=synonym_fraction)
     elif mode == "legacy":
         # Old behavior: apply synonyms, then merge, then split
-        text = add_synonums(text, fraction=synonym_fraction)
-        text = combine_sentences_recursive(text, short_threshold=6)
-        text = split_text_recursively(text, max_sentence_length=15)
-        return text
+        result = add_synonums(text, fraction=synonym_fraction)
+        result = combine_sentences_recursive(result, short_threshold=6)
+        result = split_text_recursively(result, max_sentence_length=15)
     elif mode == "unified":
         # New unified approach: apply synonyms, then normalize lengths intelligently
-        text = add_synonums(text, fraction=synonym_fraction)
-        text = normalize_sentence_lengths(text, target_min=target_min, target_max=target_max)
-        return text
+        result = add_synonums(text, fraction=synonym_fraction)
+        result = normalize_sentence_lengths(result, target_min=target_min, target_max=target_max)
     else:
         raise ValueError("Mode must be 'synonyms', 'legacy', or 'unified'")
+    
+    # Apply fillers if requested
+    if apply_fillers and filler_ratio > 0:
+        filler_config = FillerConfig(
+            ratio=filler_ratio,
+            style=filler_style,
+            structured_plan=False,
+            enforce_semantics=True
+        )
+        result = add_fillers(result, config=filler_config)
+    
+    # Clean up the final output
+    result = clean_text_output(result)
+    
+    return result
 
 # Example usage
 if __name__ == "__main__":
@@ -799,6 +1276,15 @@ if __name__ == "__main__":
     The next morning, when Aria returned to the village, her eyes shimmered faintly with golden light. The people of Eldenwood noticed. The forest, long feared, had chosen her as its keeper.
     '''
     
-    # Apply unified humanization approach (recommended)
-    humanized_text = humanize_text(text, mode="unified", synonym_fraction=0.3, target_min=15, target_max=25)
+    # Apply unified humanization approach with fillers
+    humanized_text = humanize_text(
+        text, 
+        mode="unified", 
+        synonym_fraction=0.3, 
+        target_min=15, 
+        target_max=25,
+        filler_style="casual",
+        filler_ratio=0.15,
+        apply_fillers=True
+    )
     print(humanized_text)
