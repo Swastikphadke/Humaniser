@@ -1284,7 +1284,7 @@ if __name__ == "__main__":
         target_min=15, 
         target_max=25,
         filler_style="casual",
-        filler_ratio=0.15,
+        filler_ratio=0.2,
         apply_fillers=True
     )
     print(humanized_text)
