@@ -802,11 +802,11 @@ def create_connector_merge(first_sentence, second_sentence, doc1, doc2):
     
     if connector == ";":
         # For semicolon, lowercase the next sentence
-        return first_sentence.strip('.?!') + connector + " " + second_sentence.lower()
+        return first_sentence.strip('.?!') + connector + " " + second_sentence[0].lower() + second_sentence[1:]
     elif connector.startswith(" "):
-        return first_sentence.strip('.?!') + connector + " " + second_sentence.lower()
+        return first_sentence.strip('.?!') + connector + " " + second_sentence[0].lower() + second_sentence[1:]
     else:
-        return first_sentence.strip('.?!') + connector + " " + second_sentence.lower()
+        return first_sentence.strip('.?!') + connector + " " + second_sentence[0].lower() + second_sentence[1:]
 
 def get_merge_strategy():
     """Randomly choose merge strategy with weighted probabilities."""
@@ -904,7 +904,7 @@ def pre_filter_split_candidates(doc, min_part_length=4):
                 is_candidate = True
             
             # At the start of new clauses (identified by subjects)
-            elif token.dep_ in ['nsubj', 'nsubjpass']:
+            elif token.dep_ in ['nsubj', 'nsubjpass'] and prev_token.text == ',':
                 is_candidate = True
             
             # After certain prepositions in long prepositional phrases
@@ -995,7 +995,11 @@ def analyze_split_quality(doc, split_index, target_middle):
             score += 20  # Good to split after punctuation
         elif prev_token.text in ['.', '!', '?']:
             score -= 50  # Don't split after sentence endings
-    
+
+    #7. Penalize splits before conjunctions/prepositions if there is no comma
+    if split_token.pos_ in ['SCONJ', 'ADP'] and prev_token.text != ',':
+        score -= 1000
+        
     return score
 
 def find_best_split_points(doc, min_part_length=4):
@@ -1046,9 +1050,6 @@ def clean_sentence_beginning(text):
     if text:
         text = text[0].upper() + text[1:]
     
-    # Add period if no ending punctuation
-    if not text.endswith(('.', '!', '?')):
-        text += '.'
     
     return text
 
@@ -1097,84 +1098,60 @@ def split_text_recursively(text, max_sentence_length=15, min_part_length=4):
     
     new_sentences = []
     changes_made = False
-    
-    for sentence in sentences:
-        sentence_str = sentence.text.strip()
-        sentence_doc = nlp(sentence_str)  # Re-parse individual sentence for accuracy
+
+    if random.random() < 0.8:
+        for sentence in sentences:
+            sentence_str = sentence.text.strip()
+            sentence_doc = nlp(sentence_str)  # Re-parse individual sentence for accuracy
         
-        if len(sentence_doc) > max_sentence_length:
-            split_results = split_long_sentence(sentence_str, max_sentence_length, min_part_length)
-            new_sentences.extend(split_results)
-            if len(split_results) > 1:
-                changes_made = True
-        else:
-            new_sentences.append(sentence_str)
+            if len(sentence_doc) > max_sentence_length:
+                split_results = split_long_sentence(sentence_str, max_sentence_length, min_part_length)
+                new_sentences.extend(split_results)
+                if len(split_results) > 1:
+                    changes_made = True
+            else:
+                new_sentences.append(sentence_str)
     
     # If we made changes, recursively check again (some splits might still be too long)
-    if changes_made:
-        result_text = ' '.join(new_sentences)
+        if changes_made:
+            result_text = ' '.join(new_sentences)
         # Check if any sentence is still too long using spaCy
-        result_doc = nlp(result_text)
-        needs_more_splitting = any(len(nlp(sent.text)) > max_sentence_length for sent in result_doc.sents)
+            result_doc = nlp(result_text)
+            needs_more_splitting = any(len(nlp(sent.text)) > max_sentence_length for sent in result_doc.sents)
         
-        if needs_more_splitting:
-            return split_text_recursively(result_text, max_sentence_length, min_part_length)
+            if needs_more_splitting:
+                return split_text_recursively(result_text, max_sentence_length, min_part_length)
     
-    return ' '.join(new_sentences)
+        return ' '.join(new_sentences)
 
+# --- REVISED, HIGH-QUALITY NORMALIZER ---
 def normalize_sentence_lengths(text, target_min=15, target_max=25, ideal_range=(18, 22)):
     """
-    Unified sentence length normalizer that intelligently adjusts sentence lengths
-    toward an ideal range, avoiding the merge-then-split conflict.
-    
-    Args:
-        text: Input text to normalize
-        target_min: Minimum acceptable sentence length (words)
-        target_max: Maximum acceptable sentence length (words) 
-        ideal_range: Tuple of (min_ideal, max_ideal) word counts
-    
-    Returns:
-        Text with normalized sentence lengths
+    Unified sentence length normalizer with multi-pass convergence.
+    Runs splitting and merging passes until no more beneficial changes can be made.
     """
-    doc = nlp(text)
-    sentences = [sent.text.strip() for sent in doc.sents if sent.text.strip()]
+    last_text = ""
+    current_text = text
     
-    if not sentences:
-        return text
+    # Run for a maximum of 3 passes to prevent infinite loops
+   # for pass_num in range(3):
+    if current_text == last_text:
+        return current_text  # No changes in this pass, we've converged
+    last_text = current_text
         
-    i = 0
-    while i < len(sentences):
-        current_sent = sentences[i]
-        word_count = len(current_sent.split())
+        # Pass 1: Split any sentences that are too long
+    split_text = split_text_recursively(
+        current_text, 
+        max_sentence_length=target_max
+        )
         
-        # If sentence is too long, split it
-        if word_count > target_max:
-            split_result = split_long_sentence(current_sent)
-            if len(split_result) > 1:
-                # Replace current sentence with split results
-                sentences[i:i+1] = split_result
-                # Don't increment i, recheck the first new sentence
-                continue
-                
-        # If sentence is too short, try to merge with next
-        elif word_count < target_min and i + 1 < len(sentences):
-            next_sent = sentences[i + 1]
-            next_word_count = len(next_sent.split())
-            combined_length = word_count + next_word_count
-            
-            # Only merge if result won't be too long
-            if combined_length <= target_max:
-                combined = combine_two_sentences(current_sent, next_sent)
-                if combined and combined != current_sent + " " + next_sent:
-                    # Replace both sentences with combined result
-                    sentences[i:i+2] = [combined]
-                    # Don't increment i, recheck the new combined sentence
-                    continue
-        
-        # If in ideal range or no changes possible, move to next
-        i += 1
+        # Pass 2: Merge any sentences that are too short
+    current_text = combine_sentences_recursive(
+            split_text, 
+            short_threshold=target_min
+        )
     
-    return " ".join(sentences)
+    return current_text
 
 def combine_two_sentences(sent1, sent2):
     """
@@ -1187,9 +1164,7 @@ def combine_two_sentences(sent1, sent2):
     
     # Use the existing relationship detection and combination logic
     relationship = detect_sentence_relationship(doc1, doc2)
-    if relationship == "none":
-        return None
-        
+    
     # Get appropriate connector and combine
     connector = get_smart_connector_from_docs(doc1, doc2)
     if not connector:
@@ -1199,7 +1174,7 @@ def combine_two_sentences(sent1, sent2):
     if not enhanced_pronoun_check_from_docs(doc1, doc2):
         return None
         
-    return sent1 + " " + connector + " " + sent2
+    return sent1 + connector + " " + sent2
 
 # ================== MAIN HUMANIZE FUNCTION ==================
 
@@ -1221,70 +1196,55 @@ def humanize_text(text, mode="unified", synonym_fraction=0.3, target_min=15, tar
                  filler_style="neutral", filler_ratio=0.0, apply_fillers=False):
     """
     Main function to humanize AI-generated text using a unified approach with optional fillers.
-    
-    Args:
-        text: Input text to humanize
-        mode: "unified" (recommended), "synonyms", "legacy" for old behavior
-        synonym_fraction: Fraction of frequent words to replace (default 0.3)
-        target_min: Minimum acceptable sentence length in words (default 15)
-        target_max: Maximum acceptable sentence length in words (default 25)
-        filler_style: Style for filler phrases ("neutral", "casual", "formal", "formal_strict")
-        filler_ratio: Fraction of sentences to add fillers to (0.0-1.0)
-        apply_fillers: Whether to apply filler phrases
     """
-    if mode == "synonyms":
-        result = add_synonums(text, fraction=synonym_fraction)
-    elif mode == "legacy":
-        # Old behavior: apply synonyms, then merge, then split
-        result = add_synonums(text, fraction=synonym_fraction)
-        result = combine_sentences_recursive(result, short_threshold=6)
-        result = split_text_recursively(result, max_sentence_length=15)
-    elif mode == "unified":
-        # New unified approach: apply synonyms, then normalize lengths intelligently
-        result = add_synonums(text, fraction=synonym_fraction)
-        result = normalize_sentence_lengths(result, target_min=target_min, target_max=target_max)
-    else:
-        raise ValueError("Mode must be 'synonyms', 'legacy', or 'unified'")
+    try:
+        if mode == "synonyms":
+            result = add_synonums(text, fraction=synonym_fraction)
+        elif mode == "legacy":
+            # Old behavior: apply synonyms, then merge, then split
+            result = add_synonums(text, fraction=synonym_fraction)
+            result = combine_sentences_recursive(result, short_threshold=6)
+            result = split_text_recursively(result, max_sentence_length=15)
+        elif mode == "unified":
+            # New unified approach: apply synonyms, then normalize lengths intelligently
+            result = add_synonums(text, fraction=synonym_fraction)
+            result = normalize_sentence_lengths(result, target_min=target_min, target_max=target_max)
+        else:
+            raise ValueError("Mode must be 'synonyms', 'legacy', or 'unified'")
+        
+        # Apply fillers if requested
+        if apply_fillers and filler_ratio > 0:
+            filler_config = FillerConfig(
+                ratio=filler_ratio,
+                style=filler_style,
+                structured_plan=False,
+                enforce_semantics=True
+            )
+            result = add_fillers(result, config=filler_config)
+        
+        # Clean up the final output
+        result = clean_text_output(result)
+        
+        return result
     
-    # Apply fillers if requested
-    if apply_fillers and filler_ratio > 0:
-        filler_config = FillerConfig(
-            ratio=filler_ratio,
-            style=filler_style,
-            structured_plan=False,
-            enforce_semantics=True
-        )
-        result = add_fillers(result, config=filler_config)
-    
-    # Clean up the final output
-    result = clean_text_output(result)
-    
-    return result
+    except Exception as e:
+        print(f"Error in humanize_text: {e}")
+        return text  # Return original text if processing fails
 
-# Example usage
+# Example usagecas
 if __name__ == "__main__":
-    # Sample text for demonstration
     text = '''
-    The village of Eldenwood sat quietly at the edge of a vast forest, where the trees grew so tall their tops seemed to brush the clouds. Most villagers avoided the forest after dusk, for it was said to be alive with whispers and shadows that didn't belong to any living thing.
-
-    One evening, a young girl named Aria lingered too long by the riverbank. The sun slipped below the horizon, and the familiar path home dissolved into darkness. Instead of fear, curiosity bloomed in her chest. She stepped deeper into the woods, drawn by a soft golden glow flickering between the trunks.
-
-    The light led her to a clearing where an ancient oak stood, hollow at its base. Inside, tiny orbs of light swirled like stars in miniature. They pulsed gently, as if breathing. Aria reached out, and one orb settled into her palm, warm as sunlight.
-
-    Suddenly, the whispers grew louder—but they weren't frightening. They carried words, old and kind: "Guardian chosen."
-
-    The next morning, when Aria returned to the village, her eyes shimmered faintly with golden light. The people of Eldenwood noticed. The forest, long feared, had chosen her as its keeper.
-    '''
-    
-    # Apply unified humanization approach with fillers
+The library stood at the edge of the city, older than the streets that surrounded it, older than the city itself. Its gates were wrought of black iron, twisted into shapes that seemed to shift when stared at too long. Inside, the shelves stretched endlessly upward, vanishing into a darkness no candle could pierce. The air was rich with dust, parchment, and ink, yet also with something heavier—like the weight of thoughts too vast for human minds. Books whispered when unopened, their voices weaving together in a thousand conversations. Some volumes glowed faintly, others wept ink that pooled on the floor. Scholars entered seeking wisdom, but not all left with sanity intact. It was said the library remembered every reader, and that the more one learned, the more the library learned in return.
+'''
+     # Apply unified humanization approach with fillers
     humanized_text = humanize_text(
         text, 
         mode="unified", 
-        synonym_fraction=0.3, 
-        target_min=15, 
-        target_max=25,
+        synonym_fraction=0.2, 
+        target_min=8, 
+        target_max=22,
         filler_style="casual",
-        filler_ratio=0.15,
+        filler_ratio=0.1,
         apply_fillers=True
     )
     print(humanized_text)
