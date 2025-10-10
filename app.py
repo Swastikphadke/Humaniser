@@ -4,7 +4,10 @@ import random
 import time
 import re
 import math
-from collections import Counter
+import numpy as np  
+import pickle
+import os 
+from collections import Counter, defaultdict 
 from dataclasses import dataclass, field
 from typing import List, Tuple, Optional, Dict, Iterable, Callable, Any, Sequence
 
@@ -1176,6 +1179,235 @@ def combine_two_sentences(sent1, sent2):
         
     return sent1 + connector + " " + sent2
 
+# =================== CLAUSE REORDERING (ML-BASED) ===================
+@dataclass
+class ClausePattern:
+    """Represents a learned clause reordering pattern."""
+    original_structure: str
+    reordered_structure: str
+    success_score: float
+    frequency: int
+    context_features: Dict[str, float]
+
+class ClauseReorderingML:
+    """ML-based clause reordering system that learns from patterns."""
+    
+    def __init__(self, model_path: str = "clause_patterns.pkl"):
+        self.model_path = model_path
+        self.patterns: Dict[str, ClausePattern] = {}
+        self.feature_weights: Dict[str, float] = defaultdict(float)
+        self.reordering_success_rate: float = 0.0
+        self.load_model()
+        
+        if not self.patterns:
+            self._bootstrap_patterns()
+    
+    def _bootstrap_patterns(self):
+        """Initialize with basic patterns from human writing samples."""
+        bootstrap_data = [
+            {
+                "original": "SUBJ VERB OBJ because CLAUSE",
+                "reordered": "Because CLAUSE, SUBJ VERB OBJ",
+                "score": 0.9,
+                "features": {"has_because": 1.0, "sentence_length": 0.6, "complexity": 0.7}
+            },
+            {
+                "original": "SUBJ VERB PREP_PHRASE",
+                "reordered": "PREP_PHRASE, SUBJ VERB",
+                "score": 0.8,
+                "features": {"has_prep": 1.0, "sentence_length": 0.4, "complexity": 0.3}
+            },
+            {
+                "original": "MAIN_CLAUSE if CONDITION",
+                "reordered": "If CONDITION, MAIN_CLAUSE",
+                "score": 0.9,
+                "features": {"has_conditional": 1.0, "sentence_length": 0.5, "complexity": 0.8}
+            }
+        ]
+        
+        for data in bootstrap_data:
+            pattern = ClausePattern(
+                original_structure=data["original"],
+                reordered_structure=data["reordered"],
+                success_score=data["score"],
+                frequency=10,
+                context_features=data["features"]
+            )
+            self.patterns[data["original"]] = pattern
+    
+    def extract_sentence_features(self, doc) -> Dict[str, float]:
+        """Extract linguistic features from a sentence for ML analysis."""
+        features = {}
+        features['length'] = min(len(doc) / 30.0, 1.0)
+        features['complexity'] = len([t for t in doc if t.dep_ in ['nsubj', 'dobj', 'prep']]) / max(len(doc), 1)
+        features['has_subordinate'] = float(any(t.dep_ == 'mark' for t in doc))
+        features['has_prep_phrase'] = float(any(t.pos_ == 'ADP' for t in doc))
+        features['has_participle'] = float(any(t.tag_ in ['VBG', 'VBN'] for t in doc))
+        features['has_conditional'] = float(any(t.lemma_.lower() in ['if', 'unless', 'when'] for t in doc))
+        features['has_because'] = float(any(t.lemma_.lower() in ['because', 'since', 'as'] for t in doc))
+        
+        if doc.has_vector:
+            try:
+                vectors = [t.vector for t in doc if t.has_vector and len(t.vector) > 0]
+                if vectors:
+                    features['semantic_density'] = float(np.mean([np.sum(v) for v in vectors]))
+                else:
+                    features['semantic_density'] = 0.5
+            except:
+                features['semantic_density'] = 0.5
+        else:
+            features['semantic_density'] = 0.5
+            
+        if len(doc) > 0:
+            features['starts_with_connector'] = float(doc[0].lemma_.lower() in ['because', 'although', 'if', 'when'])
+            features['ends_with_subordinate'] = float(any(t.dep_ == 'mark' and t.i > len(doc)//2 for t in doc))
+        
+        return features
+    
+    def predict_reordering_probability(self, doc) -> float:
+        """Use ML to predict if a sentence should be reordered."""
+        features = self.extract_sentence_features(doc)
+        base_prob = 0.3
+        
+        feature_boost = 0.0
+        if features.get('has_because', 0) > 0:
+            feature_boost += 0.4
+        if features.get('has_conditional', 0) > 0:
+            feature_boost += 0.3
+        if features.get('has_prep_phrase', 0) > 0:
+            feature_boost += 0.2
+            
+        final_prob = min(base_prob + feature_boost, 1.0)
+        return final_prob
+    
+    def generate_reordering_candidates(self, doc) -> List[Tuple[str, float]]:
+        """Generate multiple reordering candidates with confidence scores."""
+        candidates = []
+        
+        because_result = self._move_because_clause_to_front(doc)
+        if because_result:
+            candidates.append((because_result, 0.9))
+            
+        if_result = self._move_conditional_to_front(doc)
+        if if_result:
+            candidates.append((if_result, 0.8))
+            
+        prep_result = self._move_prep_phrase_to_front(doc)
+        if prep_result:
+            candidates.append((prep_result, 0.7))
+        
+        return sorted(candidates, key=lambda x: x[1], reverse=True)
+    
+    def _move_because_clause_to_front(self, doc) -> Optional[str]:
+        """Move 'because' clause to sentence front."""
+        because_token = None
+        for token in doc:
+            if token.lemma_.lower() in ['because', 'since'] and token.i >= 2:
+                because_token = token
+                break
+        
+        if not because_token:
+            return None
+        
+        main_clause = doc[:because_token.i].text.strip().rstrip(',')
+        because_clause = doc[because_token.i:].text.strip().rstrip('.')
+        
+        if len(main_clause) < 3 or len(because_clause) < 3:
+            return None
+        
+        because_clause = because_clause[0].upper() + because_clause[1:]
+        main_clause = main_clause[0].lower() + main_clause[1:] if main_clause else main_clause
+        
+        return f"{because_clause}, {main_clause}."
+    
+    def _move_conditional_to_front(self, doc) -> Optional[str]:
+        """Move conditional clause to front."""
+        if_token = None
+        for token in doc:
+            if token.lemma_.lower() in ['if', 'unless'] and token.i >= 2:
+                if_token = token
+                break
+        
+        if not if_token:
+            return None
+        
+        main_clause = doc[:if_token.i].text.strip().rstrip(',')
+        if_clause = doc[if_token.i:].text.strip().rstrip('.')
+        
+        if len(main_clause) < 3 or len(if_clause) < 3:
+            return None
+        
+        if_clause = if_clause[0].upper() + if_clause[1:]
+        main_clause = main_clause[0].lower() + main_clause[1:] if main_clause else main_clause
+        
+        return f"{if_clause}, {main_clause}."
+    
+    def _move_prep_phrase_to_front(self, doc) -> Optional[str]:
+        """Move prepositional phrase to front."""
+        for token in doc:
+            if (token.pos_ == 'ADP' and token.i >= 2 and token.i < len(doc) - 1):
+                phrase_end = min(token.i + 3, len(doc))
+                main_part = doc[:token.i].text.strip().rstrip(',')
+                prep_phrase = doc[token.i:phrase_end].text.strip()
+                remainder = doc[phrase_end:].text.strip() if phrase_end < len(doc) else ""
+                
+                if len(main_part) >= 3 and len(prep_phrase) >= 2:
+                    prep_phrase = prep_phrase[0].upper() + prep_phrase[1:]
+                    main_part = main_part[0].lower() + main_part[1:] if main_part else main_part
+                    
+                    return f"{prep_phrase}, {main_part}{remainder}".rstrip() + "."
+        
+        return None
+    
+    def reorder_text(self, text: str, threshold: float = 0.5) -> str:
+        """Main function to reorder clauses in text using ML predictions."""
+        doc = nlp(text)
+        sentences = list(doc.sents)
+        
+        reordered_sentences = []
+        for sent in sentences:
+            reorder_prob = self.predict_reordering_probability(sent)
+            
+            if reorder_prob > threshold:
+                candidates = self.generate_reordering_candidates(sent)
+                if candidates and candidates[0][1] > 0.3:
+                    reordered_sentences.append(candidates[0][0])
+                else:
+                    reordered_sentences.append(sent.text.strip())
+            else:
+                reordered_sentences.append(sent.text.strip())
+        
+        return ' '.join(reordered_sentences)
+    
+    def save_model(self):
+        """Save the learned patterns and weights."""
+        model_data = {
+            'patterns': self.patterns,
+            'feature_weights': dict(self.feature_weights),
+            'success_rate': self.reordering_success_rate
+        }
+        with open(self.model_path, 'wb') as f:
+            pickle.dump(model_data, f)
+    
+    def load_model(self):
+        """Load previously learned patterns and weights."""
+        if os.path.exists(self.model_path):
+            try:
+                with open(self.model_path, 'rb') as f:
+                    model_data = pickle.load(f)
+                self.patterns = model_data.get('patterns', {})
+                self.feature_weights = defaultdict(float, model_data.get('feature_weights', {}))
+                self.reordering_success_rate = model_data.get('success_rate', 0.0)
+            except Exception as e:
+                print(f"Error loading model: {e}")
+                self.patterns = {}
+                self.feature_weights = defaultdict(float)
+
+def reorder_clauses_ml(text: str, threshold: float = 0.4, model_path: str = "clause_patterns.pkl") -> str:
+    """Main function for ML-based clause reordering."""
+    reorderer = ClauseReorderingML(model_path)
+    return reorderer.reorder_text(text, threshold)
+
 # ================== MAIN HUMANIZE FUNCTION ==================
 
 def clean_text_output(text):
@@ -1193,9 +1425,22 @@ def clean_text_output(text):
     return text.strip()
 
 def humanize_text(text, mode="unified", synonym_fraction=0.3, target_min=15, target_max=25, 
-                 filler_style="neutral", filler_ratio=0.0, apply_fillers=False):
+                 filler_style="neutral", filler_ratio=0.0, apply_fillers=False,
+                 apply_clause_reordering=False, clause_threshold=0.4):
     """
-    Main function to humanize AI-generated text using a unified approach with optional fillers.
+    Main function to humanize AI-generated text using a unified approach with optional fillers and clause reordering.
+    
+    Args:
+        text: Input text to humanize
+        mode: Processing mode ("synonyms", "legacy", or "unified")
+        synonym_fraction: Fraction of words to replace with synonyms (0.0-1.0)
+        target_min: Minimum target sentence length
+        target_max: Maximum target sentence length
+        filler_style: Style of filler phrases ("neutral", "casual", "formal", "formal_strict")
+        filler_ratio: Ratio of sentences to add fillers to (0.0-1.0)
+        apply_fillers: Whether to apply filler phrases
+        apply_clause_reordering: Whether to apply ML-based clause reordering
+        clause_threshold: Threshold for clause reordering probability (0.0-1.0, lower = more aggressive)
     """
     try:
         if mode == "synonyms":
@@ -1211,6 +1456,10 @@ def humanize_text(text, mode="unified", synonym_fraction=0.3, target_min=15, tar
             result = normalize_sentence_lengths(result, target_min=target_min, target_max=target_max)
         else:
             raise ValueError("Mode must be 'synonyms', 'legacy', or 'unified'")
+        
+        # Apply ML-based clause reordering if requested
+        if apply_clause_reordering:
+            result = reorder_clauses_ml(result, threshold=clause_threshold)
         
         # Apply fillers if requested
         if apply_fillers and filler_ratio > 0:
@@ -1234,7 +1483,7 @@ def humanize_text(text, mode="unified", synonym_fraction=0.3, target_min=15, tar
 # Example usagecas
 if __name__ == "__main__":
     text = '''
-The library stood at the edge of the city, older than the streets that surrounded it, older than the city itself. Its gates were wrought of black iron, twisted into shapes that seemed to shift when stared at too long. Inside, the shelves stretched endlessly upward, vanishing into a darkness no candle could pierce. The air was rich with dust, parchment, and ink, yet also with something heavier—like the weight of thoughts too vast for human minds. Books whispered when unopened, their voices weaving together in a thousand conversations. Some volumes glowed faintly, others wept ink that pooled on the floor. Scholars entered seeking wisdom, but not all left with sanity intact. It was said the library remembered every reader, and that the more one learned, the more the library learned in return.
+The desert was not silent, though it seemed so at first. Beneath its endless dunes, a rhythm throbbed faintly, like the heartbeat of the earth itself. At night, the sands glittered with shards of glass, catching the starlight in hues of violet and gold, as though the ground itself remembered fire. Nomads told stories of buried cities that stirred in their sleep, their towers rising and sinking with the shifting dunes. Travelers swore the horizon sometimes bent, reshaping itself into walls, gates, or statues that melted back into sand when approached. Strange winds carried voices across the expanse—languages no one recognized but everyone understood. Those who listened too long often wandered aimlessly, chasing mirages that grew sharper with every step, until the sand swallowed them whole, leaving only footprints that glowed faintly in the moonlight.
 '''
      # Apply unified humanization approach with fillers
     humanized_text = humanize_text(
@@ -1242,7 +1491,7 @@ The library stood at the edge of the city, older than the streets that surrounde
         mode="unified", 
         synonym_fraction=0.2, 
         target_min=8, 
-        target_max=22,
+        target_max=18,
         filler_style="casual",
         filler_ratio=0.1,
         apply_fillers=True
