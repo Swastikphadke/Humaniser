@@ -1126,6 +1126,8 @@ def split_text_recursively(text, max_sentence_length=15, min_part_length=4):
                 return split_text_recursively(result_text, max_sentence_length, min_part_length)
     
         return ' '.join(new_sentences)
+    else:
+        return ' '.join([s.text.strip() for s in sentences])
 
 # --- REVISED, HIGH-QUALITY NORMALIZER ---
 def normalize_sentence_lengths(text, target_min=15, target_max=25, ideal_range=(18, 22)):
@@ -1483,7 +1485,7 @@ def humanize_text(text, mode="unified", synonym_fraction=0.3, target_min=15, tar
 # Example usagecas
 if __name__ == "__main__":
     text = '''
-The desert was not silent, though it seemed so at first. Beneath its endless dunes, a rhythm throbbed faintly, like the heartbeat of the earth itself. At night, the sands glittered with shards of glass, catching the starlight in hues of violet and gold, as though the ground itself remembered fire. Nomads told stories of buried cities that stirred in their sleep, their towers rising and sinking with the shifting dunes. Travelers swore the horizon sometimes bent, reshaping itself into walls, gates, or statues that melted back into sand when approached. Strange winds carried voices across the expanse—languages no one recognized but everyone understood. Those who listened too long often wandered aimlessly, chasing mirages that grew sharper with every step, until the sand swallowed them whole, leaving only footprints that glowed faintly in the moonlight.
+At dusk, when the market closed, a quiet man set up his cart at the edge of town. His candles were unlike any other — some burned with blue fire, others with smoke shaped like faces. His sign read: “Candles for memories — yours or mine.” People came with their sorrows. For a lock of hair or a single tear, he’d craft a candle that burned their grief into light. The rich bought them as curiosities. The lonely bought them as hope. But none noticed the merchant growing dimmer with each sale, his shadow thinning as if feeding the flames. One night, a small child approached, clutching a broken toy. “Can you make one for happiness?” she asked. The merchant hesitated — he had never been asked that. Still, he melted every scrap of leftover wax and poured it into a single jar. When it cooled, it shone like dawn. He lit it for her, and for the first time, the flame glowed warm gold. The merchant smiled, his body dissolving into sparks that joined the light. The next morning, the cart was gone — only the golden candle remained, burning still, its smoke spelling gentle words in the air: “Trade fairly. Burn kindly.”
 '''
      # Apply unified humanization approach with fillers
     humanized_text = humanize_text(
