@@ -1428,7 +1428,7 @@ def clean_text_output(text):
 
 def humanize_text(text, mode="unified", synonym_fraction=0.3, target_min=15, target_max=25, 
                  filler_style="neutral", filler_ratio=0.0, apply_fillers=False,
-                 apply_clause_reordering=False, clause_threshold=0.4):
+                 apply_clause_reordering=True, clause_threshold=0.6):
     """
     Main function to humanize AI-generated text using a unified approach with optional fillers and clause reordering.
     
@@ -1485,17 +1485,17 @@ def humanize_text(text, mode="unified", synonym_fraction=0.3, target_min=15, tar
 # Example usagecas
 if __name__ == "__main__":
     text = '''
-At dusk, when the market closed, a quiet man set up his cart at the edge of town. His candles were unlike any other — some burned with blue fire, others with smoke shaped like faces. His sign read: “Candles for memories — yours or mine.” People came with their sorrows. For a lock of hair or a single tear, he’d craft a candle that burned their grief into light. The rich bought them as curiosities. The lonely bought them as hope. But none noticed the merchant growing dimmer with each sale, his shadow thinning as if feeding the flames. One night, a small child approached, clutching a broken toy. “Can you make one for happiness?” she asked. The merchant hesitated — he had never been asked that. Still, he melted every scrap of leftover wax and poured it into a single jar. When it cooled, it shone like dawn. He lit it for her, and for the first time, the flame glowed warm gold. The merchant smiled, his body dissolving into sparks that joined the light. The next morning, the cart was gone — only the golden candle remained, burning still, its smoke spelling gentle words in the air: “Trade fairly. Burn kindly.”
+Virtual Reality, often abbreviated as VR, is an immersive digital technology that simulates real or imagined environments to create interactive three-dimensional experiences. Users wear head-mounted displays equipped with motion sensors and controllers that track their movements, enabling them to explore virtual spaces as if physically present. VR applications extend beyond entertainment and gaming into education, medicine, real estate, design, and training. In classrooms, VR allows students to explore historical landmarks or scientific concepts through interactive simulations. In medicine, surgeons use VR to rehearse complex operations, improving precision and confidence. Architects visualize projects before construction, while mental health professionals employ VR therapy to treat phobias and stress disorders through controlled exposure. The technology operates by processing real-time graphics and adjusting them based on user perspective, creating a sense of depth and realism. However, VR faces challenges such as high equipment costs, motion sickness, and accessibility limitations. As hardware becomes more affordable and software ecosystems mature, adoption continues to expand. Virtual Reality is redefining how humans interact with information, transforming learning, creativity, and communication across diverse industries in the increasingly digital twenty-first century.
 '''
      # Apply unified humanization approach with fillers
     humanized_text = humanize_text(
         text, 
         mode="unified", 
         synonym_fraction=0.2, 
-        target_min=8, 
-        target_max=18,
-        filler_style="casual",
-        filler_ratio=0.1,
+        target_min=10, 
+        target_max=25,
+        filler_style="formal",
+        filler_ratio=0.10,
         apply_fillers=True
     )
     print(humanized_text)
