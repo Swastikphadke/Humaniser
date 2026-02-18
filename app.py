@@ -7,7 +7,10 @@ import math
 import numpy as np  
 import pickle
 import os 
+import logging
 from collections import Counter, defaultdict 
+from dataclasses import dataclass, field
+from typing import List, Tuple, Optional, Dict, Iterable, Callable, Any, Sequence
 from dataclasses import dataclass, field
 from typing import List, Tuple, Optional, Dict, Iterable, Callable, Any, Sequence
 
@@ -16,6 +19,17 @@ try:
     nlp = spacy.load("en_core_web_md")  # Has word vectors
 except OSError:
     nlp = spacy.load("en_core_web_sm")  # Fallback to small model
+
+HAS_VECTORS = bool(nlp.vocab.vectors_length)
+
+LOGGING_ENABLED = True
+LOGGER = logging.getLogger(__name__)
+if not LOGGER.handlers:
+    logging.basicConfig(level=logging.INFO)
+
+def _log(level: int, msg: str) -> None:
+    if LOGGING_ENABLED:
+        LOGGER.log(level, msg)
 
 # =========================
 # Filler Phrase Categories
@@ -72,6 +86,20 @@ WEAK_FUNCTION_WORDS = {"and", "but", "or", "so", "yet"}
 ZERO_WIDTH_MARK = "\u200B"  # used for subtle marker if needed
 
 # =========================
+# Text Tuning Config
+# =========================
+@dataclass
+class TextTuningConfig:
+    quote_dominated_threshold: float = 0.28
+    split_text_prob: float = 0.8
+    bursty_short_len: int = 8
+    bursty_long_len: int = 25
+    bursty_split_max: int = 18
+    combine_short_threshold: int = 6
+
+DEFAULT_TUNING = TextTuningConfig()
+
+# =========================
 # Config Dataclass
 # =========================
 @dataclass
@@ -111,12 +139,13 @@ def _is_dialogue(sent: str) -> bool:
     s = sent.strip()
     return s.startswith(("\"", "'", '''"''', "'"))
 
-def _quote_dominated(sent: str) -> bool:
+def _quote_dominated(sent: str, tuning: TextTuningConfig = DEFAULT_TUNING) -> bool:
     total = len(sent)
     if total == 0:
         return False
-    quote_chars = sent.count('"') + sent.count("'") + sent.count('"') + sent.count('"') + sent.count(''') + sent.count(''')
-    return (quote_chars / total) > 0.28  # heuristic threshold
+    # Simplified quote count (avoid duplicate counting)
+    quote_chars = sent.count('"') + sent.count("'")
+    return (quote_chars / total) > tuning.quote_dominated_threshold
 
 def _already_has_filler(sent_text: str) -> bool:
     lowered = sent_text.strip().lower()
@@ -219,10 +248,30 @@ def _get_weighted_filler(
     fillers: List[str],
     global_freq: Dict[str, int],
     recent: List[str],
-    cfg: FillerConfig
+    cfg: FillerConfig,
+    sentence_text: str = ""
 ) -> Optional[str]:
     
     if not fillers:
+        return None
+
+    # Sentiment-aware filtering
+    blob = TextBlob(sentence_text or "")
+    polarity = blob.sentiment.polarity
+    subjectivity = blob.sentiment.subjectivity
+
+    valid_fillers = []
+    for f in fillers:
+        if f in ["frankly", "to be honest", "truthfully"]:
+            if abs(polarity) > 0.3 or subjectivity > 0.5:
+                valid_fillers.append(f)
+        elif f == "basically":
+            if len(sentence_text.split()) > 10:
+                valid_fillers.append(f)
+        else:
+            valid_fillers.append(f)
+
+    if not valid_fillers:
         return None
         
     # Select the weighting function based on the config
@@ -231,11 +280,8 @@ def _get_weighted_filler(
     else:
         weight_fn = lambda f: _linear_weight(f, global_freq, recent, cfg.repetition_recent_penalty, cfg.repetition_global_penalty)
     
-    # Calculate the weight (score) for each candidate filler - FIX: Call the function
-    weights = [weight_fn(f) for f in fillers]
-    
-    # Use random.choices to pick one filler based on the calculated weights
-    return rng.choices(population=fillers, weights=weights, k=1)[0]
+    weights = [weight_fn(f) for f in valid_fillers]
+    return rng.choices(population=valid_fillers, weights=weights, k=1)[0]
 
 def _weighted_choice(rng: random.Random, fillers: List[str], weight_fn) -> str:
     scores = [weight_fn(f) for f in fillers]
@@ -397,6 +443,12 @@ def add_fillers(
             continue
         if cfg.skip_discourse_lead and _starts_with_discourse_marker(stripped):
             continue
+    # --- ADD THIS NEW CHECK ---
+    # Don't put fillers before greetings like "Hey", "Hi", etc.
+        if stripped.lower().startswith(("hey", "hi ", "hello", "dear", "greetings")):
+            continue
+    # --------------------------
+
         candidates.append(i)
 
     if not candidates:
@@ -427,7 +479,14 @@ def add_fillers(
             output.append(original_text)
             continue
 
-        filler = _get_weighted_filler(rng, mode_fillers, global_freq, recent, cfg)
+        filler = _get_weighted_filler(
+            rng, 
+            mode_fillers, 
+            global_freq, 
+            recent, 
+            cfg,
+            sentence_text=original_text
+        )
         if not filler:
             output.append(original_text)
             continue
@@ -496,7 +555,7 @@ def remove_fillers(text: str, nlp_pipeline: Any = None) -> str:
 # EXISTING SYNONYM FUNCTIONS
 # =========================
 
-def add_synonums(text, fraction=0.25):
+def add_synonyms(text, fraction=0.25):
     doc = nlp(text) 
     
     # Step 1: Count frequencies first
@@ -564,15 +623,21 @@ def add_synonums(text, fraction=0.25):
     
     return ''.join(new_tokens).strip()
 
+# Backward-compatible alias
+def add_synonums(text, fraction=0.25):
+    """Deprecated: use add_synonyms() instead."""
+    return add_synonyms(text, fraction=fraction)
+
 def find_best_synonym(word_text, pos_type, use_randomness=True):
     """Find the best synonym for a word with quality controls."""
     word = Word(word_text)
     blob1 = TextBlob(word_text)
-    
-    # Define POS tags to check
+
+    original_token = nlp(word_text)[0]
+
     if pos_type == "ADV":
         valid_tags = ['RB', 'RBR', 'RBS']
-    else:  # ADJ
+    else:
         valid_tags = ['JJ', 'JJR', 'JJS']
     
     candidates = []
@@ -581,7 +646,6 @@ def find_best_synonym(word_text, pos_type, use_randomness=True):
         for lemma in syn.lemmas():
             synonym = lemma.name().replace('_', ' ')
             
-            # Quality control filters
             if not is_quality_synonym(synonym, word_text):
                 continue
                 
@@ -589,30 +653,30 @@ def find_best_synonym(word_text, pos_type, use_randomness=True):
             synonym_tags = blob.tags
             is_correct_pos = any(tag[1] in valid_tags for tag in synonym_tags)
             
-            # RELAXED sentiment comparison - just needs ANY improvement
             polarity_improved = abs(blob.sentiment.polarity) >= abs(blob1.sentiment.polarity) * 0.8
             subjectivity_improved = abs(blob.sentiment.subjectivity) >= abs(blob1.sentiment.subjectivity) * 0.8
             
-            if polarity_improved and subjectivity_improved and is_correct_pos:
-                score = abs(blob.sentiment.polarity) + abs(blob.sentiment.subjectivity)
-                candidates.append((synonym, score))
+            if not (polarity_improved and subjectivity_improved and is_correct_pos):
+                continue
+
+            similarity = 0.5
+            syn_token = nlp(synonym)[0]
+            if HAS_VECTORS and original_token.has_vector and syn_token.has_vector:
+                similarity = original_token.similarity(syn_token)
+                if similarity < 0.45:
+                    continue
+
+            score = similarity + (abs(blob.sentiment.polarity) + abs(blob.sentiment.subjectivity)) * 0.1
+            candidates.append((synonym, score))
     
     if not candidates:
         return None
     
-    # Sort by score and add randomness
     candidates.sort(key=lambda x: x[1], reverse=True)
     
-    if use_randomness and len(candidates) > 1:
-        # 70% chance to pick best, 30% chance for variety
-        if random.random() < 0.7:
-            return candidates[0][0]
-        else:
-            # Pick from top 3 candidates randomly
-            top_candidates = candidates[:min(3, len(candidates))]
-            return random.choice(top_candidates)[0]
-    else:
-        return candidates[0][0]
+    if use_randomness and len(candidates) > 2:
+        return random.choice(candidates[:3])[0]
+    return candidates[0][0]
 
 def is_quality_synonym(synonym, original):
     """Quality control checks for synonyms."""
@@ -811,69 +875,81 @@ def create_connector_merge(first_sentence, second_sentence, doc1, doc2):
     else:
         return first_sentence.strip('.?!') + connector + " " + second_sentence[0].lower() + second_sentence[1:]
 
-def get_merge_strategy():
+def get_merge_strategy(rng: Optional[random.Random] = None):
     """Randomly choose merge strategy with weighted probabilities."""
+    rng = rng or random
     strategies = [("connector", 60), ("relative_clause", 20), ("no_merge", 20)]
     strategy_names, weights = zip(*strategies)
-    return random.choices(strategy_names, weights=weights)[0]
+    return rng.choices(strategy_names, weights=weights)[0]
 
-def combine_sentences_recursive(text, short_threshold=6):
-    """Recursively combine sentences with improved logic."""
-    blob = TextBlob(text)
-    sentences = list(blob.sentences)
-    
+def _combine_sentences_recursive_spacy(
+    text,
+    short_threshold=6,
+    rng: Optional[random.Random] = None,
+    tuning: TextTuningConfig = DEFAULT_TUNING
+):
+    """Recursively combine sentences using spaCy only."""
+    rng = rng or random
+    doc = nlp(text)
+    sentences = list(doc.sents)
+
     new_sentences = []
     changes_made = False
-    
+
     i = 0
     while i < len(sentences):
         if i >= len(sentences) - 1:
-            new_sentences.append(str(sentences[i]))
+            new_sentences.append(sentences[i].text.strip())
             i += 1
             continue
 
-        # Parse sentences once
-        doc1 = nlp(str(sentences[i]))
-        doc2 = nlp(str(sentences[i+1]))
-        
-        # Use TextBlob word count for consistency
-        length1 = len(sentences[i].words)
-        length2 = len(sentences[i+1].words)
-        
-        # Check conditions with consistent length counting
-        if (length1 <= short_threshold and length2 <= short_threshold and 
-            doc2[0].pos_ == "PRON" and 
+        doc1 = sentences[i]
+        doc2 = sentences[i + 1]
+
+        length1 = len(doc1)
+        length2 = len(doc2)
+
+        if (length1 <= short_threshold and length2 <= short_threshold and
+            doc2[0].pos_ == "PRON" and
             enhanced_pronoun_check_from_docs(doc1, doc2)):
-            
-            strategy = get_merge_strategy()
+
+            strategy = get_merge_strategy(rng)
             combined = None
-            
+
             if strategy == "relative_clause":
                 subject = next((t for t in doc1 if t.dep_ in ("nsubj", "nsubjpass")), None)
                 combined = create_relative_clause(doc1, doc2, subject)
                 if not combined:
-                    strategy = "connector" 
-                
+                    strategy = "connector"
+
             if strategy == "connector":
-                combined = create_connector_merge(str(sentences[i]), str(sentences[i+1]), doc1, doc2)
-            
+                combined = create_connector_merge(doc1.text, doc2.text, doc1, doc2)
+
             if strategy != "no_merge" and combined:
                 new_sentences.append(combined)
                 changes_made = True
                 i += 2
             else:
-                new_sentences.append(str(sentences[i]))
+                new_sentences.append(doc1.text.strip())
                 i += 1
         else:
-            new_sentences.append(str(sentences[i]))
+            new_sentences.append(doc1.text.strip())
             i += 1
 
     result_text = ' '.join(new_sentences)
-    
+
     if changes_made:
-        return combine_sentences_recursive(result_text, short_threshold)
+        return _combine_sentences_recursive_spacy(result_text, short_threshold, rng, tuning)
     else:
         return result_text
+
+def combine_sentences_recursive(
+    text,
+    short_threshold=6,
+    rng: Optional[random.Random] = None,
+    tuning: TextTuningConfig = DEFAULT_TUNING
+):
+    return _combine_sentences_recursive_spacy(text, short_threshold, rng, tuning)
 
 # ================== NEW SENTENCE SPLITTING FUNCTIONS ==================
 
@@ -1056,7 +1132,7 @@ def clean_sentence_beginning(text):
     
     return text
 
-def split_long_sentence(sentence_text, max_length=15, min_part_length=4):
+def split_long_sentence(sentence_text, max_length=15, min_part_length=7):
     """
     Intelligently splits long sentences using linguistic analysis.
     Returns a list of sentences.
@@ -1090,341 +1166,200 @@ def split_long_sentence(sentence_text, max_length=15, min_part_length=4):
     
     return [first_text, second_text]
 
-def split_text_recursively(text, max_sentence_length=15, min_part_length=4):
+def split_text_recursively(text, max_sentence_length=15, min_part_length=4, tuning: TextTuningConfig = DEFAULT_TUNING):
     """
     Optimized version using spaCy's sentence segmentation for consistency.
     Recursively splits all long sentences in a text.
     """
-    # Use spaCy for sentence segmentation instead of TextBlob
     doc = nlp(text)
     sentences = list(doc.sents)
-    
+
     new_sentences = []
     changes_made = False
 
-    if random.random() < 0.8:
+    if random.random() < tuning.split_text_prob:
         for sentence in sentences:
             sentence_str = sentence.text.strip()
-            sentence_doc = nlp(sentence_str)  # Re-parse individual sentence for accuracy
-        
-            if len(sentence_doc) > max_sentence_length:
+
+            if len(sentence) > max_sentence_length:
                 split_results = split_long_sentence(sentence_str, max_sentence_length, min_part_length)
                 new_sentences.extend(split_results)
                 if len(split_results) > 1:
                     changes_made = True
             else:
                 new_sentences.append(sentence_str)
-    
-    # If we made changes, recursively check again (some splits might still be too long)
+
         if changes_made:
             result_text = ' '.join(new_sentences)
-        # Check if any sentence is still too long using spaCy
             result_doc = nlp(result_text)
-            needs_more_splitting = any(len(nlp(sent.text)) > max_sentence_length for sent in result_doc.sents)
-        
+            needs_more_splitting = any(len(s) > max_sentence_length for s in result_doc.sents)
+
             if needs_more_splitting:
-                return split_text_recursively(result_text, max_sentence_length, min_part_length)
-    
+                return split_text_recursively(result_text, max_sentence_length, min_part_length, tuning)
+
         return ' '.join(new_sentences)
     else:
         return ' '.join([s.text.strip() for s in sentences])
 
 # --- REVISED, HIGH-QUALITY NORMALIZER ---
-def normalize_sentence_lengths(text, target_min=15, target_max=25, ideal_range=(18, 22)):
+def normalize_sentence_lengths(
+    text,
+    target_min=15,
+    target_max=25,
+    ideal_range=(18, 22),
+    max_passes=3,
+    tuning: TextTuningConfig = DEFAULT_TUNING
+):
     """
     Unified sentence length normalizer with multi-pass convergence.
     Runs splitting and merging passes until no more beneficial changes can be made.
     """
-    last_text = ""
     current_text = text
-    
-    # Run for a maximum of 3 passes to prevent infinite loops
-   # for pass_num in range(3):
-    if current_text == last_text:
-        return current_text  # No changes in this pass, we've converged
-    last_text = current_text
-        
-        # Pass 1: Split any sentences that are too long
-    split_text = split_text_recursively(
-        current_text, 
-        max_sentence_length=target_max
+    last_text = None
+
+    for _ in range(max_passes):
+        if current_text == last_text:
+            break
+        last_text = current_text
+
+        split_text = split_text_recursively(
+            current_text,
+            max_sentence_length=target_max,
+            tuning=tuning
         )
-        
-        # Pass 2: Merge any sentences that are too short
-    current_text = combine_sentences_recursive(
-            split_text, 
-            short_threshold=target_min
+
+        current_text = combine_sentences_recursive(
+            split_text,
+            short_threshold=target_min,
+            tuning=tuning
         )
-    
+
     return current_text
 
-def combine_two_sentences(sent1, sent2):
-    """
-    Intelligently combine two sentences using the existing combination logic.
-    This is a helper function for the unified approach.
-    """
-    # Create documents for analysis
-    doc1 = nlp(sent1)
-    doc2 = nlp(sent2)
-    
-    # Use the existing relationship detection and combination logic
-    relationship = detect_sentence_relationship(doc1, doc2)
-    
-    # Get appropriate connector and combine
-    connector = get_smart_connector_from_docs(doc1, doc2)
-    if not connector:
-        return None
-        
-    # Perform pronoun validation
-    if not enhanced_pronoun_check_from_docs(doc1, doc2):
-        return None
-        
-    return sent1 + connector + " " + sent2
+def combine_sentences_recursive(text, short_threshold=6, rng: Optional[random.Random] = None, tuning: TextTuningConfig = DEFAULT_TUNING):
+    """Recursively combine sentences with improved logic."""
+    doc = nlp(text)
+    sentences = list(doc.sents)
 
-# =================== CLAUSE REORDERING (ML-BASED) ===================
-@dataclass
-class ClausePattern:
-    """Represents a learned clause reordering pattern."""
-    original_structure: str
-    reordered_structure: str
-    success_score: float
-    frequency: int
-    context_features: Dict[str, float]
+    new_sentences = []
+    changes_made = False
 
-class ClauseReorderingML:
-    """ML-based clause reordering system that learns from patterns."""
-    
-    def __init__(self, model_path: str = "clause_patterns.pkl"):
-        self.model_path = model_path
-        self.patterns: Dict[str, ClausePattern] = {}
-        self.feature_weights: Dict[str, float] = defaultdict(float)
-        self.reordering_success_rate: float = 0.0
-        self.load_model()
-        
-        if not self.patterns:
-            self._bootstrap_patterns()
-    
-    def _bootstrap_patterns(self):
-        """Initialize with basic patterns from human writing samples."""
-        bootstrap_data = [
-            {
-                "original": "SUBJ VERB OBJ because CLAUSE",
-                "reordered": "Because CLAUSE, SUBJ VERB OBJ",
-                "score": 0.9,
-                "features": {"has_because": 1.0, "sentence_length": 0.6, "complexity": 0.7}
-            },
-            {
-                "original": "SUBJ VERB PREP_PHRASE",
-                "reordered": "PREP_PHRASE, SUBJ VERB",
-                "score": 0.8,
-                "features": {"has_prep": 1.0, "sentence_length": 0.4, "complexity": 0.3}
-            },
-            {
-                "original": "MAIN_CLAUSE if CONDITION",
-                "reordered": "If CONDITION, MAIN_CLAUSE",
-                "score": 0.9,
-                "features": {"has_conditional": 1.0, "sentence_length": 0.5, "complexity": 0.8}
-            }
-        ]
-        
-        for data in bootstrap_data:
-            pattern = ClausePattern(
-                original_structure=data["original"],
-                reordered_structure=data["reordered"],
-                success_score=data["score"],
-                frequency=10,
-                context_features=data["features"]
-            )
-            self.patterns[data["original"]] = pattern
-    
-    def extract_sentence_features(self, doc) -> Dict[str, float]:
-        """Extract linguistic features from a sentence for ML analysis."""
-        features = {}
-        features['length'] = min(len(doc) / 30.0, 1.0)
-        features['complexity'] = len([t for t in doc if t.dep_ in ['nsubj', 'dobj', 'prep']]) / max(len(doc), 1)
-        features['has_subordinate'] = float(any(t.dep_ == 'mark' for t in doc))
-        features['has_prep_phrase'] = float(any(t.pos_ == 'ADP' for t in doc))
-        features['has_participle'] = float(any(t.tag_ in ['VBG', 'VBN'] for t in doc))
-        features['has_conditional'] = float(any(t.lemma_.lower() in ['if', 'unless', 'when'] for t in doc))
-        features['has_because'] = float(any(t.lemma_.lower() in ['because', 'since', 'as'] for t in doc))
-        
-        if doc.has_vector:
-            try:
-                vectors = [t.vector for t in doc if t.has_vector and len(t.vector) > 0]
-                if vectors:
-                    features['semantic_density'] = float(np.mean([np.sum(v) for v in vectors]))
-                else:
-                    features['semantic_density'] = 0.5
-            except:
-                features['semantic_density'] = 0.5
-        else:
-            features['semantic_density'] = 0.5
-            
-        if len(doc) > 0:
-            features['starts_with_connector'] = float(doc[0].lemma_.lower() in ['because', 'although', 'if', 'when'])
-            features['ends_with_subordinate'] = float(any(t.dep_ == 'mark' and t.i > len(doc)//2 for t in doc))
-        
-        return features
-    
-    def predict_reordering_probability(self, doc) -> float:
-        """Use ML to predict if a sentence should be reordered."""
-        features = self.extract_sentence_features(doc)
-        base_prob = 0.3
-        
-        feature_boost = 0.0
-        if features.get('has_because', 0) > 0:
-            feature_boost += 0.4
-        if features.get('has_conditional', 0) > 0:
-            feature_boost += 0.3
-        if features.get('has_prep_phrase', 0) > 0:
-            feature_boost += 0.2
-            
-        final_prob = min(base_prob + feature_boost, 1.0)
-        return final_prob
-    
-    def generate_reordering_candidates(self, doc) -> List[Tuple[str, float]]:
-        """Generate multiple reordering candidates with confidence scores."""
-        candidates = []
-        
-        because_result = self._move_because_clause_to_front(doc)
-        if because_result:
-            candidates.append((because_result, 0.9))
-            
-        if_result = self._move_conditional_to_front(doc)
-        if if_result:
-            candidates.append((if_result, 0.8))
-            
-        prep_result = self._move_prep_phrase_to_front(doc)
-        if prep_result:
-            candidates.append((prep_result, 0.7))
-        
-        return sorted(candidates, key=lambda x: x[1], reverse=True)
-    
-    def _move_because_clause_to_front(self, doc) -> Optional[str]:
-        """Move 'because' clause to sentence front."""
-        because_token = None
-        for token in doc:
-            if token.lemma_.lower() in ['because', 'since'] and token.i >= 2:
-                because_token = token
-                break
-        
-        if not because_token:
-            return None
-        
-        main_clause = doc[:because_token.i].text.strip().rstrip(',')
-        because_clause = doc[because_token.i:].text.strip().rstrip('.')
-        
-        if len(main_clause) < 3 or len(because_clause) < 3:
-            return None
-        
-        because_clause = because_clause[0].upper() + because_clause[1:]
-        main_clause = main_clause[0].lower() + main_clause[1:] if main_clause else main_clause
-        
-        return f"{because_clause}, {main_clause}."
-    
-    def _move_conditional_to_front(self, doc) -> Optional[str]:
-        """Move conditional clause to front."""
-        if_token = None
-        for token in doc:
-            if token.lemma_.lower() in ['if', 'unless'] and token.i >= 2:
-                if_token = token
-                break
-        
-        if not if_token:
-            return None
-        
-        main_clause = doc[:if_token.i].text.strip().rstrip(',')
-        if_clause = doc[if_token.i:].text.strip().rstrip('.')
-        
-        if len(main_clause) < 3 or len(if_clause) < 3:
-            return None
-        
-        if_clause = if_clause[0].upper() + if_clause[1:]
-        main_clause = main_clause[0].lower() + main_clause[1:] if main_clause else main_clause
-        
-        return f"{if_clause}, {main_clause}."
-    
-    def _move_prep_phrase_to_front(self, doc) -> Optional[str]:
-        """Move prepositional phrase to front."""
-        for token in doc:
-            if (token.pos_ == 'ADP' and token.i >= 2 and token.i < len(doc) - 1):
-                phrase_end = min(token.i + 3, len(doc))
-                main_part = doc[:token.i].text.strip().rstrip(',')
-                prep_phrase = doc[token.i:phrase_end].text.strip()
-                remainder = doc[phrase_end:].text.strip() if phrase_end < len(doc) else ""
-                
-                if len(main_part) >= 3 and len(prep_phrase) >= 2:
-                    prep_phrase = prep_phrase[0].upper() + prep_phrase[1:]
-                    main_part = main_part[0].lower() + main_part[1:] if main_part else main_part
-                    
-                    return f"{prep_phrase}, {main_part}{remainder}".rstrip() + "."
-        
-        return None
-    
-    def reorder_text(self, text: str, threshold: float = 0.5) -> str:
-        """Main function to reorder clauses in text using ML predictions."""
-        doc = nlp(text)
-        sentences = list(doc.sents)
-        
-        reordered_sentences = []
-        for sent in sentences:
-            reorder_prob = self.predict_reordering_probability(sent)
-            
-            if reorder_prob > threshold:
-                candidates = self.generate_reordering_candidates(sent)
-                if candidates and candidates[0][1] > 0.3:
-                    reordered_sentences.append(candidates[0][0])
-                else:
-                    reordered_sentences.append(sent.text.strip())
+    i = 0
+    while i < len(sentences):
+        if i >= len(sentences) - 1:
+            new_sentences.append(sentences[i].text.strip())
+            i += 1
+            continue
+
+        doc1 = sentences[i]
+        doc2 = sentences[i + 1]
+
+        length1 = len(doc1)
+        length2 = len(doc2)
+
+        if (length1 <= short_threshold and length2 <= short_threshold and
+            doc2[0].pos_ == "PRON" and
+            enhanced_pronoun_check_from_docs(doc1, doc2)):
+
+            strategy = get_merge_strategy(rng)
+            combined = None
+
+            if strategy == "relative_clause":
+                subject = next((t for t in doc1 if t.dep_ in ("nsubj", "nsubjpass")), None)
+                combined = create_relative_clause(doc1, doc2, subject)
+                if not combined:
+                    strategy = "connector"
+
+            if strategy == "connector":
+                combined = create_connector_merge(doc1.text, doc2.text, doc1, doc2)
+
+            if strategy != "no_merge" and combined:
+                new_sentences.append(combined)
+                changes_made = True
+                i += 2
             else:
-                reordered_sentences.append(sent.text.strip())
-        
-        return ' '.join(reordered_sentences)
-    
-    def save_model(self):
-        """Save the learned patterns and weights."""
-        model_data = {
-            'patterns': self.patterns,
-            'feature_weights': dict(self.feature_weights),
-            'success_rate': self.reordering_success_rate
-        }
-        with open(self.model_path, 'wb') as f:
-            pickle.dump(model_data, f)
-    
-    def load_model(self):
-        """Load previously learned patterns and weights."""
-        if os.path.exists(self.model_path):
-            try:
-                with open(self.model_path, 'rb') as f:
-                    model_data = pickle.load(f)
-                self.patterns = model_data.get('patterns', {})
-                self.feature_weights = defaultdict(float, model_data.get('feature_weights', {}))
-                self.reordering_success_rate = model_data.get('success_rate', 0.0)
-            except Exception as e:
-                print(f"Error loading model: {e}")
-                self.patterns = {}
-                self.feature_weights = defaultdict(float)
+                new_sentences.append(doc1.text.strip())
+                i += 1
+        else:
+            new_sentences.append(doc1.text.strip())
+            i += 1
 
-def reorder_clauses_ml(text: str, threshold: float = 0.4, model_path: str = "clause_patterns.pkl") -> str:
-    """Main function for ML-based clause reordering."""
-    reorderer = ClauseReorderingML(model_path)
-    return reorderer.reorder_text(text, threshold)
+    result_text = ' '.join(new_sentences)
 
-# ================== MAIN HUMANIZE FUNCTION ==================
+    if changes_made:
+        return combine_sentences_recursive(result_text, short_threshold, rng, tuning)
+    else:
+        return result_text
 
-def clean_text_output(text):
-    """Clean up formatting issues in the final output."""
-    # Fix stray punctuation patterns
-    text = re.sub(r'\s*\.\s*;\s*', '. ', text)  # Fix ". ;" → ". "
-    text = re.sub(r'\s*,\s*and\s+', ', and ', text)  # Fix ", and " spacing
-    text = re.sub(r'\s+', ' ', text)  # Fix multiple spaces
-    text = re.sub(r'\s+([.!?])', r'\1', text)  # Fix space before punctuation
-    text = re.sub(r'([.!?])\s*([a-z])', r'\1 \2', text)  # Ensure space after punctuation
-    
-    # Fix sentence fragments that start with conjunctions
-    text = re.sub(r'\.\s*(and|but|or|so)\s+([A-Z])', r', \1 \2', text)
-    
-    return text.strip()
+def apply_burstiness(text, nlp_pipeline=None, rng: Optional[random.Random] = None, tuning: TextTuningConfig = DEFAULT_TUNING):
+    """
+    Creates variation: short punchy sentences + longer flowy ones.
+    """
+    pipeline = nlp_pipeline or nlp
+    rng = rng or random
+    doc = pipeline(text)
+    sentences = [s.text.strip() for s in doc.sents]
+    new_sentences = []
+
+    i = 0
+    while i < len(sentences):
+        current_len = len(sentences[i].split())
+
+        if i < len(sentences) - 1:
+            next_len = len(sentences[i + 1].split())
+
+            if current_len < tuning.bursty_short_len and next_len < tuning.bursty_short_len:
+                if rng.random() < 0.3:
+                    combined = combine_two_sentences(sentences[i], sentences[i + 1])
+                    if combined:
+                        new_sentences.append(combined)
+                        i += 2
+                        continue
+
+            elif current_len > tuning.bursty_long_len:
+                split_parts = split_long_sentence(sentences[i], max_length=tuning.bursty_split_max)
+                new_sentences.extend(split_parts)
+                i += 1
+                continue
+
+        new_sentences.append(sentences[i])
+        i += 1
+
+    return " ".join(new_sentences)
+
+def combine_two_sentences(sent1, sent2):
+    """Combine two sentences into one."""
+    return sent1 + " " + sent2
+
+# Alias for clarity (keep backward compatibility)
+def add_synonyms(text, fraction=0.25):
+    return add_synonums(text, fraction=fraction)
+
+FRAGMENT_LEADERS = {
+    "that", "which", "if", "because", "although", "though", "since",
+    "when", "while", "whereas", "unless", "until", "after", "before", "as"
+}
+
+def merge_fragment_sentences(text, nlp_pipeline=None):
+    """
+    Merge likely fragment sentences that start with subordinators/relatives.
+    """
+    pipeline = nlp_pipeline or nlp
+    doc = pipeline(text)
+    sentences = [s.text.strip() for s in doc.sents]
+    merged = []
+
+    for sent in sentences:
+        if not sent:
+            continue
+        first_word = sent.split()[0].lower().strip(",.;:!?")
+        if merged and first_word in FRAGMENT_LEADERS:
+            merged[-1] = merged[-1].rstrip() + " " + sent
+        else:
+            merged.append(sent)
+
+    return " ".join(merged)
+
 
 def humanize_text(text, mode="unified", synonym_fraction=0.3, target_min=15, target_max=25, 
                  filler_style="neutral", filler_ratio=0.0, apply_fillers=False,
@@ -1453,9 +1388,10 @@ def humanize_text(text, mode="unified", synonym_fraction=0.3, target_min=15, tar
             result = combine_sentences_recursive(result, short_threshold=6)
             result = split_text_recursively(result, max_sentence_length=15)
         elif mode == "unified":
-            # New unified approach: apply synonyms, then normalize lengths intelligently
+            # New unified approach: apply synonyms, then burstiness rhythm
             result = add_synonums(text, fraction=synonym_fraction)
-            result = normalize_sentence_lengths(result, target_min=target_min, target_max=target_max)
+            result = apply_burstiness(result)
+            result = merge_fragment_sentences(result)
         else:
             raise ValueError("Mode must be 'synonyms', 'legacy', or 'unified'")
         
@@ -1485,7 +1421,10 @@ def humanize_text(text, mode="unified", synonym_fraction=0.3, target_min=15, tar
 # Example usagecas
 if __name__ == "__main__":
     text = '''
-Virtual Reality, often abbreviated as VR, is an immersive digital technology that simulates real or imagined environments to create interactive three-dimensional experiences. Users wear head-mounted displays equipped with motion sensors and controllers that track their movements, enabling them to explore virtual spaces as if physically present. VR applications extend beyond entertainment and gaming into education, medicine, real estate, design, and training. In classrooms, VR allows students to explore historical landmarks or scientific concepts through interactive simulations. In medicine, surgeons use VR to rehearse complex operations, improving precision and confidence. Architects visualize projects before construction, while mental health professionals employ VR therapy to treat phobias and stress disorders through controlled exposure. The technology operates by processing real-time graphics and adjusting them based on user perspective, creating a sense of depth and realism. However, VR faces challenges such as high equipment costs, motion sickness, and accessibility limitations. As hardware becomes more affordable and software ecosystems mature, adoption continues to expand. Virtual Reality is redefining how humans interact with information, transforming learning, creativity, and communication across diverse industries in the increasingly digital twenty-first century.
+Hey everyone 
+I saw a post today about an AI video model that supposedly can generate blockbuster style CGI scenes just from a text prompt. Hype or not, it really made me pause and think about how quickly generative video is evolving.
+If AI models do reach true Hollywood level quality someday, what do you think will actually be the hardest challenge to solve, keeping long scenes consistent, realistic physics, emotional realism, compute limitations or anything as such?
+Would love to know your thoughts on this.
 '''
      # Apply unified humanization approach with fillers
     humanized_text = humanize_text(
